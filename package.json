@@ -1,0 +1,18 @@
+{
+  "name": "safe-wallet",
+  "version": "0.1.0",
+  "description": "多签钱包策略引擎：阈值策略、签名收集、重放防护、执行队列与策略变更任务",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
