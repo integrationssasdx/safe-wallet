@@ -1,10 +1,10 @@
 /**
  * 多签钱包策略引擎。
  *
- * 在阈值策略、签名收集、重放防护与 FIFO 执行队列之上，新增“策略变更任务”：
- * 所有者以当前阈值签名，决定替换所有者集合、确认数；任务入队，按既有排序/防重/
- * 终态规则执行；执行成功才原子替换策略并令版本递增一次，执行时版本漂移则
- * PolicyConflict 进入既有失败终态。
+ * 在阈值策略、签名收集、重放防护、FIFO 执行队列与策略变更任务之上，新增“任务取消”：
+ * 当前所有者以阈值签名（safe-wallet/cancel/v1 域，绑定钱包标识、目标任务 digest、nonce、
+ * 截止时间）撤销尚未执行的 queued 任务；目标任务进入 cancelled 终态（保留原 payload/
+ * digest/nonce，记录取消时间与摘要），不执行其效果、不改变策略、只消费本次 nonce。
  */
 
 import {
@@ -15,18 +15,22 @@ import {
   recoverAddress,
 } from './crypto.ts';
 import {
+  hashCancellation,
   hashPolicyChange,
   hashTransaction,
   type PolicyChangeRequest,
   type TransactionRequest,
 } from './encoding.ts';
 import {
+  InvalidCancellation,
   InvalidPolicyChange,
   InvalidTransaction,
   NonceAlreadyUsedError,
   RequestExpired,
   PolicyConflict,
   InvalidQueueStateError,
+  TaskCancellationConflict,
+  TaskNotFoundError,
 } from './errors.ts';
 import { ExecutionQueue, type QueueTask } from './queue.ts';
 
@@ -79,6 +83,13 @@ export interface PolicyChangeSubmission {
   deadline: bigint | number;
   newOwners: string[];
   newConfirmations: bigint | number;
+}
+
+export interface CancellationSubmission {
+  /** 目标任务 id（队列快照中的任务标识） */
+  taskId: string;
+  nonce: bigint | number;
+  deadline: bigint | number;
 }
 
 function isNonNegativeInteger(n: bigint, maxBits = 256): boolean {
@@ -192,6 +203,93 @@ export class MultiSigWallet {
       },
       signatures,
     );
+  }
+
+  // ---------- 任务取消 ----------
+
+  /**
+   * 取消一个尚未执行的 queued 任务。
+   *
+   * 取消摘要使用 safe-wallet/cancel/v1 域标签，绑定钱包标识、目标任务 digest、nonce 与
+   * 截止时间：签名无法改绑其他任务、其他钱包或其他时间窗口。
+   *
+   * 校验顺序（任一失败都不改变任务、不消费 nonce、不改变策略）：
+   *   1) 字段非法 → InvalidCancellation
+   *   2) nonce 复用 → NonceAlreadyUsedError（旧请求重放恒得此异常，即使已过期）
+   *   3) deadline 早于当前时间 → RequestExpired
+   *   4) nonce 顺序（须等于 expectedNonce）→ InvalidCancellation
+   *   5) 目标不存在 → TaskNotFoundError；目标已终态 → TaskCancellationConflict
+   *   6) 阈值签名（当前所有者、去重后达到当前确认数）→ InvalidCancellation
+   *
+   * 成功时目标任务由 queued 进入 cancelled 终态并返回：保留原 payload/digest/nonce，
+   * 记录取消时间与取消摘要；不执行目标效果，不改变 owners/确认数/策略版本，
+   * 只消费本次 nonce 并推进 expectedNonce。取消不要求任务在队首，也不调整队列顺序。
+   */
+  cancelTask(
+    taskId: string,
+    nonce: bigint | number,
+    deadline: bigint | number,
+    signatures: readonly Uint8Array[],
+  ): WalletTask;
+  cancelTask(sub: CancellationSubmission, signatures: readonly Uint8Array[]): WalletTask;
+  cancelTask(
+    a: string | CancellationSubmission,
+    b: readonly Uint8Array[] | bigint | number,
+    c?: bigint | number,
+    d?: readonly Uint8Array[],
+  ): WalletTask {
+    const sub: CancellationSubmission =
+      typeof a === 'string' || a === undefined || a === null
+        ? { taskId: a as string, nonce: b as bigint | number, deadline: c as bigint | number }
+        : a;
+    const signatures: readonly Uint8Array[] =
+      (typeof a === 'string' || a === undefined || a === null ? d : (b as readonly Uint8Array[])) ??
+      ([] as readonly Uint8Array[]);
+
+    // (1) 字段安全转换（畸形输入只抛 InvalidCancellation）
+    const nonce = toBigInt(sub.nonce, InvalidCancellation, 'nonce');
+    if (!isNonNegativeInteger(nonce)) {
+      throw new InvalidCancellation('nonce must be a non-negative integer');
+    }
+    // (2) nonce 复用优先于过期判定
+    if (this.usedNonces.has(nonce)) throw new NonceAlreadyUsedError(nonce);
+
+    const deadline = toBigInt(sub.deadline, InvalidCancellation, 'deadline');
+    if (!isNonNegativeInteger(deadline)) throw new InvalidCancellation('deadline out of range');
+    // (3) 截止时间
+    if (deadline < this.now()) {
+      throw new RequestExpired(`request deadline ${deadline} already passed`);
+    }
+    // (4) nonce 顺序：取消与提交共用同一严格递增序列
+    if (nonce !== this.nextNonce) {
+      throw new InvalidCancellation(`expected nonce ${this.nextNonce}, got ${nonce}`);
+    }
+
+    // (5) 目标任务状态
+    const taskId = sub.taskId;
+    if (typeof taskId !== 'string' || taskId.length === 0) {
+      throw new InvalidCancellation('taskId must be a non-empty string');
+    }
+    const target = this.queue.getTask(taskId);
+    if (target === null) throw new TaskNotFoundError(`task not found: ${taskId}`);
+    if (target.status !== 'queued') {
+      throw new TaskCancellationConflict(`task ${taskId} is already ${target.status}`);
+    }
+
+    // (6) 阈值签名：摘要绑定钱包标识、目标任务 digest、nonce、deadline
+    const digest = hashCancellation({
+      walletId: this.id,
+      taskDigest: target.digest,
+      nonce,
+      deadline,
+    });
+    this.verifyThresholdSignatures(digest, signatures, InvalidCancellation);
+
+    // 原子生效：目标任务进入 cancelled 终态 + 消费 nonce；策略与队列顺序不变
+    const cancelled = this.queue.cancel(taskId, this.now(), digest.toString('hex'));
+    this.usedNonces.add(nonce);
+    this.nextNonce = nonce + 1n;
+    return cancelled;
   }
 
   // ---------- 执行 ----------
@@ -319,7 +417,7 @@ export class MultiSigWallet {
   private verifyThresholdSignatures(
     digest: Uint8Array,
     signatures: readonly Uint8Array[],
-    Invalid: typeof InvalidPolicyChange,
+    Invalid: new (msg: string) => Error,
   ): void {
     if (!Array.isArray(signatures)) {
       throw new Invalid('signatures must be an array');

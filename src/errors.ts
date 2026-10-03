@@ -36,6 +36,12 @@ export class NonceAlreadyUsedError extends WalletError {
   }
 }
 
+/** 取消请求字段、nonce 顺序或签名不合法（不改变任务、不消费 nonce、不改策略） */
+export class InvalidCancellation extends WalletError {}
+
+/** 目标任务已处于终态（executed / failed / cancelled），不可再取消 */
+export class TaskCancellationConflict extends WalletError {}
+
 /** 对不存在任务、终态任务重复执行等队列层面的非法操作 */
 export class TaskNotFoundError extends WalletError {}
 

@@ -19,6 +19,7 @@ import { sha256, hexToBytes, type Address } from './crypto.ts';
 
 const TAG_TX = 'safe-wallet/tx/v1';
 const TAG_POLICY_CHANGE = 'safe-wallet/policy-change/v1';
+const TAG_CANCEL = 'safe-wallet/cancel/v1';
 
 // ---------- 编码原语 ----------
 
@@ -80,6 +81,14 @@ export interface PolicyChangeRequest {
   newConfirmations: bigint;
 }
 
+export interface CancellationRequest {
+  walletId: string;
+  /** 目标任务的签名摘要（hex）：把取消请求绑定到唯一任务，防止改绑其他任务 */
+  taskDigest: string;
+  nonce: bigint;
+  deadline: bigint;
+}
+
 function walletIdBytes(walletId: string): Buffer {
   // 钱包标识统一按 UTF-8 参与签名绑定（任意字符串均可）
   return Buffer.from(walletId, 'utf8');
@@ -124,5 +133,20 @@ export function hashPolicyChange(req: {
     encUint(deadlineToBigint(req.deadline)),
     encUint(req.newConfirmations),
     encList(req.newOwners.map((o) => hexToBytes(o))),
+  ]);
+}
+
+/** 任务取消的签名摘要：绑定钱包标识、目标任务摘要、nonce 与截止时间 */
+export function hashCancellation(req: {
+  walletId: string;
+  taskDigest: string;
+  nonce: bigint | number;
+  deadline: bigint | number;
+}): Buffer {
+  return digest(TAG_CANCEL, [
+    encBytes(walletIdBytes(req.walletId)),
+    encBytes(hexToBytes(req.taskDigest)),
+    encUint(req.nonce),
+    encUint(deadlineToBigint(req.deadline)),
   ]);
 }

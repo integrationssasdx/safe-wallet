@@ -1,6 +1,6 @@
 # Safe Wallet
 
-多签钱包策略引擎：阈值策略、签名收集、重放防护、执行队列，以及在此之上的**策略变更任务**。
+多签钱包策略引擎：阈值策略、签名收集、重放防护、执行队列、策略变更任务，以及**任务取消**。
 
 本仓库从零实现上述能力，不依赖任何外部同类实现或第三方密码学/以太坊库（仅使用 Node.js 内置的
 `node:crypto` 提供 SHA-256/HMAC 与随机数；secp256k1 点运算、RFC 6979 签名与公钥恢复均为内置实现）。
@@ -12,7 +12,7 @@
 
 ```bash
 npm install        # 仅安装类型检查所需的 devDependencies（typescript / @types/node）
-npm test           # 运行全部 64 项测试
+npm test           # 运行全部 81 项测试
 npm run typecheck  # 严格类型检查
 ```
 
@@ -24,9 +24,9 @@ npm run typecheck  # 严格类型检查
 | --- | --- |
 | `owners` | 当前所有者地址集合（有序、唯一、非零地址） |
 | `confirmations` | 当前阈值（确认数），`1 <= confirmations <= owners.length` |
-| `version` | 当前策略版本，初始为 `1`，**每次成功执行策略变更恰好递增一次** |
-| `nonce` 序列 | 普通交易与策略变更**共用**的严格递增序列号，入队即消费 |
-| 执行队列 | FIFO：只有队首可执行；任务有 `queued / executed / failed` 三态，终态不可逆 |
+| `version` | 当前策略版本，初始为 `1`，**每次成功执行策略变更恰好递增一次**（取消不递增） |
+| `nonce` 序列 | 普通交易、策略变更与取消**共用**的严格递增序列号，入队/生效即消费 |
+| 执行队列 | FIFO：只有队首可执行；任务有 `queued / executed / failed / cancelled` 四态，终态不可逆 |
 
 ### 两类任务
 
@@ -36,6 +36,29 @@ npm run typecheck  # 严格类型检查
   截止时间。执行成功时**原子地**同时替换所有者集合与确认数，并令版本递增一次。
 
 两类操作使用不同的域分隔标签，因此普通交易签名不能用于策略变更，反之亦然。
+
+### 任务取消
+
+当前所有者可以撤销一个尚未执行的 `queued` 任务：`cancelTask` 接收目标任务 id、nonce、
+截止时间与签名数组。取消摘要使用独立的域标签 `safe-wallet/cancel/v1`，绑定**钱包标识、
+目标任务 digest、nonce、截止时间**——签名无法改绑其他任务、其他钱包或其他时间窗口，
+三类操作的签名也互不通用。
+
+校验顺序（任一失败都**不改变任务、不消费 nonce、不改变策略**）：
+
+1. 字段非法 → `InvalidCancellation`；
+2. nonce 复用 → `NonceAlreadyUsedError`（旧请求重放恒得此异常，即使已过期）；
+3. deadline 早于当前时间 → `RequestExpired`；
+4. nonce 顺序（须等于 `expectedNonce`）→ `InvalidCancellation`；
+5. 目标不存在 → `TaskNotFoundError`；目标已是 `executed / failed / cancelled` →
+   `TaskCancellationConflict`；
+6. 阈值签名（当前所有者、去重后达到当前确认数）→ `InvalidCancellation`。
+
+成功时目标任务由 `queued` 进入 `cancelled` 终态并返回：保留原 payload/digest/nonce，
+记录取消时间与取消摘要（`task.cancellation`）；**不执行目标效果，不改变 owners、确认数
+或策略版本**，只消费本次 nonce 并推进 `expectedNonce`。取消不要求任务在队首，也不调整
+队列顺序；`executeTask` 对 cancelled 任务直接返回终态（不产生效果），`executeNext`
+越过队首或连续的 cancelled 任务执行首个 `queued` 任务，剩余全是终态时返回 `null`。
 
 ## 提交流程（普通交易与策略变更共用）
 
@@ -64,6 +87,8 @@ npm run typecheck  # 严格类型检查
 ## 执行流程
 
 - 只有**队首任务**可执行；任务在队列中按 FIFO 排序，提交后即对 `tasks` 快照可见。
+  队首（或连续）的 `cancelled` 任务视为已越过：`executeNext` 执行首个 `queued` 任务，
+  剩余全是终态时返回 `null`。
 - **普通交易**：执行产出转账结果（收款方/金额/数据），不触碰策略状态。
 - **策略变更**：
   - 执行的生效条件是穷尽的：**任务绑定版本仍等于当前版本，且队列允许执行（队首）**。
@@ -87,6 +112,8 @@ npm run typecheck  # 严格类型检查
 | --- | --- |
 | `InvalidTransaction` | 普通交易字段、nonce 顺序或签名不合法 |
 | `InvalidPolicyChange` | 策略变更字段、版本（提交时）、nonce 顺序或签名不合法 |
+| `InvalidCancellation` | 取消请求字段、nonce 顺序或签名不合法 |
+| `TaskCancellationConflict` | 取消目标已处于终态（executed / failed / cancelled） |
 | `RequestExpired` | 截止时间早于当前时间（提交时抛出；执行时表现为失败终态回执原因） |
 | `PolicyConflict` | 执行时任务绑定版本已不等于当前版本（失败终态） |
 | `NonceAlreadyUsedError` | nonce 已被使用（公开重放异常，含 `.usedNonce`） |
@@ -112,6 +139,7 @@ digest = sha256( encStr(domainTag) || 各字段 )
 - 普通交易域标签：`safe-wallet/tx/v1`，字段为钱包标识、nonce、截止时间、收款方、金额、数据。
 - 策略变更域标签：`safe-wallet/policy-change/v1`，字段为钱包标识、版本、nonce、截止时间、
   新确认数、新所有者列表。
+- 任务取消域标签：`safe-wallet/cancel/v1`，字段为钱包标识、目标任务 digest、nonce、截止时间。
 
 ## 密码学约定
 

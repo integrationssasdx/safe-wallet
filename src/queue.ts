@@ -3,12 +3,14 @@
  *
  * 队列本身不关心任务内容：准入校验由钱包引擎完成；执行语义由执行器回调提供。
  * 任务 id 由入队序号与任务摘要派生，保证同一引擎内可复现、可引用。
+ * 任务状态：queued → executed / failed / cancelled（均为终态，不可逆）。
+ * 取消不要求任务在队首、不调整队列顺序；执行时越过队首（或连续）的 cancelled 任务。
  */
 
 import { createHash } from 'node:crypto';
-import { InvalidQueueStateError, TaskNotFoundError } from './errors.ts';
+import { InvalidQueueStateError, TaskCancellationConflict, TaskNotFoundError } from './errors.ts';
 
-export type TaskStatus = 'queued' | 'executed' | 'failed';
+export type TaskStatus = 'queued' | 'executed' | 'failed' | 'cancelled';
 
 export interface QueueTask<P = unknown> {
   id: string;
@@ -21,6 +23,14 @@ export interface QueueTask<P = unknown> {
   digest: string;
   payload: P;
   receipt?: ExecutionReceipt;
+  /** 取消终态的记录：取消时间与取消请求摘要；仅 status === 'cancelled' 时存在 */
+  cancellation?: CancellationRecord;
+}
+
+export interface CancellationRecord {
+  cancelledAt: bigint;
+  /** 取消请求的签名摘要（hex，safe-wallet/cancel/v1 域） */
+  digest: string;
 }
 
 export interface ExecutionReceipt {
@@ -79,14 +89,15 @@ export class ExecutionQueue<P = unknown> {
 
   /**
    * 执行指定任务。
-   * - 仅队首可执行（保证排序/nonce 语义）；
-   * - 终态任务重复调用直接返回既有回执，不重复生效（幂等）；
+   * - 仅队首可执行（保证排序/nonce 语义）；队首的已取消任务视为已越过，不计入排序；
+   * - 终态任务（含 cancelled）重复调用直接返回既有状态，不重复生效（幂等）；
    * - 不存在的 id 抛 TaskNotFoundError；非队首的待执行任务抛 InvalidQueueStateError。
    */
   execute(id: string, now: bigint): QueueTask<P> {
     const task = this.tasks.find((t) => t.id === id);
     if (task === undefined) throw new TaskNotFoundError(`task not found: ${id}`);
-    if (task.status !== 'queued') return task; // 幂等：回放终态回执
+    if (task.status !== 'queued') return task; // 幂等：回放终态（executed/failed/cancelled）
+    this.advanceHead();
     if (task.seq !== this.head) {
       throw new InvalidQueueStateError(`task ${id} is not at queue head`);
     }
@@ -104,8 +115,34 @@ export class ExecutionQueue<P = unknown> {
     return task;
   }
 
-  /** 执行当前队首；队列已排空时返回 null */
+  /**
+   * 取消指定任务（不要求在队首，也不调整队列顺序）。
+   * 目标任务必须由 queued 进入 cancelled 终态：保留原 payload/digest/nonce，
+   * 记录取消时间与取消摘要；不存在的 id 抛 TaskNotFoundError，
+   * 已终态（executed/failed/cancelled）抛 TaskCancellationConflict。
+   */
+  cancel(id: string, now: bigint, digest: string): QueueTask<P> {
+    const task = this.tasks.find((t) => t.id === id);
+    if (task === undefined) throw new TaskNotFoundError(`task not found: ${id}`);
+    if (task.status !== 'queued') {
+      throw new TaskCancellationConflict(`task ${id} is already ${task.status}`);
+    }
+    task.status = 'cancelled';
+    task.cancellation = { cancelledAt: now, digest };
+    this.advanceHead();
+    return task;
+  }
+
+  /** 越过队首（或连续）的终态任务，使 head 指向首个 queued 任务（或排空） */
+  private advanceHead(): void {
+    while (this.head < this.tasks.length && this.tasks[this.head]!.status !== 'queued') {
+      this.head += 1;
+    }
+  }
+
+  /** 执行首个 queued 任务（越过队首或连续的 cancelled 任务）；剩余全是终态时返回 null */
   executeNext(now: bigint): QueueTask<P> | null {
+    this.advanceHead();
     const head = this.peekHead();
     if (head === null) return null;
     return this.execute(head.id, now);
