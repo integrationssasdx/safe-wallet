@@ -3,12 +3,20 @@
  *
  * 队列本身不关心任务内容：准入校验由钱包引擎完成；执行语义由执行器回调提供。
  * 任务 id 由入队序号与任务摘要派生，保证同一引擎内可复现、可引用。
+ *
+ * 任务四态：queued（待执行）与 executed / failed / cancelled 三个终态。
+ * cancelled 由所有者取消流程写入（不要求任务在队首，也不调整队列顺序）；
+ * executeNext 会越过队首连续的 cancelled（及其他终态）任务，执行首个 queued 任务。
  */
 
 import { createHash } from 'node:crypto';
-import { InvalidQueueStateError, TaskNotFoundError } from './errors.ts';
+import {
+  InvalidQueueStateError,
+  TaskCancellationConflict,
+  TaskNotFoundError,
+} from './errors.ts';
 
-export type TaskStatus = 'queued' | 'executed' | 'failed';
+export type TaskStatus = 'queued' | 'executed' | 'failed' | 'cancelled';
 
 export interface QueueTask<P = unknown> {
   id: string;
@@ -23,14 +31,26 @@ export interface QueueTask<P = unknown> {
   receipt?: ExecutionReceipt;
 }
 
+/** 取消终态专属记录：取消请求自身的 nonce、取消摘要与取消时间 */
+export interface CancellationInfo {
+  /** 取消请求的 nonce（区别于目标任务的 nonce） */
+  nonce: bigint;
+  /** 取消摘要（safe-wallet/cancel/v1 域），hex */
+  digest: string;
+  cancelledAt: bigint;
+}
+
 export interface ExecutionReceipt {
-  status: Extract<TaskStatus, 'executed' | 'failed'>;
-  /** 失败时为错误名称（如 PolicyConflict / RequestExpired），成功时为 null */
+  status: Extract<TaskStatus, 'executed' | 'failed' | 'cancelled'>;
+  /** 失败时为错误名称（如 PolicyConflict / RequestExpired），成功/取消时为 null */
   failureReason: string | null;
   failureMessage: string | null;
+  /** executed/failed 为执行时间；cancelled 为取消时间 */
   executedAt: bigint;
   /** 成功执行的输出（执行器回调返回） */
   result?: unknown;
+  /** 仅终态为 cancelled 时存在 */
+  cancellation?: CancellationInfo;
 }
 
 /**
@@ -72,21 +92,34 @@ export class ExecutionQueue<P = unknown> {
     return task;
   }
 
-  /** 队首任务；队列空或队首已终态时为 null */
+  /**
+   * 队首任务：游标所指的第一个 queued 任务。
+   * 游标落在 cancelled 等终态任务上时惰性越过（不调整任务顺序）；
+   * 队列空或剩余任务全为终态时为 null。
+   */
   peekHead(): QueueTask<P> | null {
+    this.skipTerminal();
     return this.head < this.tasks.length ? (this.tasks[this.head] ?? null) : null;
+  }
+
+  /** 越过游标处连续的终态任务（cancelled 不随执行推进游标，需由此统一越过） */
+  private skipTerminal(): void {
+    while (this.head < this.tasks.length && this.tasks[this.head]!.status !== 'queued') {
+      this.head += 1;
+    }
   }
 
   /**
    * 执行指定任务。
-   * - 仅队首可执行（保证排序/nonce 语义）；
-   * - 终态任务重复调用直接返回既有回执，不重复生效（幂等）；
+   * - 仅队首的 queued 任务可执行（保证排序/nonce 语义）；
+   * - 终态任务（含 cancelled）重复调用直接返回既有回执，不重复生效（幂等）；
    * - 不存在的 id 抛 TaskNotFoundError；非队首的待执行任务抛 InvalidQueueStateError。
    */
   execute(id: string, now: bigint): QueueTask<P> {
     const task = this.tasks.find((t) => t.id === id);
     if (task === undefined) throw new TaskNotFoundError(`task not found: ${id}`);
     if (task.status !== 'queued') return task; // 幂等：回放终态回执
+    this.skipTerminal();
     if (task.seq !== this.head) {
       throw new InvalidQueueStateError(`task ${id} is not at queue head`);
     }
@@ -104,11 +137,37 @@ export class ExecutionQueue<P = unknown> {
     return task;
   }
 
-  /** 执行当前队首；队列已排空时返回 null */
+  /**
+   * 取消一个 queued 任务，令其进入 cancelled 终态。
+   * - 不要求任务在队首，也不调整队列顺序（游标在 executeNext 时自然越过）；
+   * - 不调用执行器：目标效果绝不执行；payload / digest / nonce 原样保留；
+   * - 目标不存在抛 TaskNotFoundError；已是 executed/failed/cancelled 抛 TaskCancellationConflict。
+   */
+  cancel(id: string, info: CancellationInfo, now: bigint): QueueTask<P> {
+    const task = this.tasks.find((t) => t.id === id);
+    if (task === undefined) throw new TaskNotFoundError(`task not found: ${id}`);
+    if (task.status !== 'queued') {
+      throw new TaskCancellationConflict(`task ${id} is already in terminal state ${task.status}`);
+    }
+    task.status = 'cancelled';
+    task.receipt = {
+      status: 'cancelled',
+      failureReason: null,
+      failureMessage: null,
+      executedAt: now,
+      cancellation: { nonce: info.nonce, digest: info.digest, cancelledAt: now },
+    };
+    return task;
+  }
+
+  /**
+   * 执行当前首个 queued 任务：越过队首或连续的终态任务（典型为 cancelled），
+   * 不调整任务本身的顺序。剩余全是终态（或队列空）时返回 null。
+   */
   executeNext(now: bigint): QueueTask<P> | null {
-    const head = this.peekHead();
-    if (head === null) return null;
-    return this.execute(head.id, now);
+    this.skipTerminal();
+    if (this.head >= this.tasks.length) return null;
+    return this.execute(this.tasks[this.head]!.id, now);
   }
 
   getTask(id: string): QueueTask<P> | null {

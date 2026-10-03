@@ -1,5 +1,5 @@
 import { generateKeyPair, signDigest, sha256, type Address, type KeyPair } from '../src/crypto.ts';
-import { hashPolicyChange, hashTransaction } from '../src/encoding.ts';
+import { hashCancellation, hashPolicyChange, hashTransaction } from '../src/encoding.ts';
 
 export interface Actor extends KeyPair {}
 
@@ -72,6 +72,23 @@ export function signPolicyChange(
 ): Buffer[] {
   const finalParams = opts.mutate ? opts.mutate(p) : p;
   const digest = hashPolicyChange(finalParams);
+  return signers.map((s) => signDigest(s.privateKey, digest));
+}
+
+export interface CancelParams {
+  walletId: string;
+  taskDigest: string;
+  nonce: bigint;
+  deadline: bigint;
+}
+
+export function signCancellation(
+  signers: Actor[],
+  p: CancelParams,
+  opts: { mutate?: (base: CancelParams) => CancelParams } = {},
+): Buffer[] {
+  const finalParams = opts.mutate ? opts.mutate(p) : p;
+  const digest = hashCancellation(finalParams);
   return signers.map((s) => signDigest(s.privateKey, digest));
 }
 

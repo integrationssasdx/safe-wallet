@@ -1,7 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { ExecutionQueue } from '../src/queue.ts';
-import { InvalidQueueStateError, PolicyConflict, TaskNotFoundError } from '../src/errors.ts';
+import {
+  InvalidQueueStateError,
+  PolicyConflict,
+  TaskCancellationConflict,
+  TaskNotFoundError,
+} from '../src/errors.ts';
 
 function makeQueue(exec?: (t: any) => unknown) {
   const calls: string[] = [];
@@ -110,4 +115,80 @@ test('入队序号与 id 稳定且唯一', () => {
   assert.notEqual(a.id, b.id);
   assert.equal(a.seq, 0);
   assert.equal(b.seq, 1);
+});
+
+// ---------- 任务取消 ----------
+
+test('取消 queued 任务 → cancelled 终态，不调用执行器，原 payload/digest/nonce 保留', () => {
+  const { queue, calls } = makeQueue();
+  const a = enq(queue, 0);
+  const r = queue.cancel(a.id, { nonce: 9n, digest: 'cancel-digest', cancelledAt: 5n }, 5n);
+  assert.equal(r.status, 'cancelled');
+  assert.equal(r.payload.seq, 0);
+  assert.equal(r.digest, 'd-0');
+  assert.equal(r.nonce, 0n);
+  assert.deepEqual(calls, []); // 目标效果绝不执行
+  const info = r.receipt!.cancellation!;
+  assert.equal(info.nonce, 9n);
+  assert.equal(info.digest, 'cancel-digest');
+  assert.equal(info.cancelledAt, 5n);
+  assert.equal(r.receipt!.executedAt, 5n);
+  assert.equal(r.receipt!.failureReason, null);
+});
+
+test('取消不要求队首，也不调整队列顺序', () => {
+  const { queue } = makeQueue();
+  const a = enq(queue, 0);
+  const b = enq(queue, 1);
+  const c = enq(queue, 2);
+  queue.cancel(b.id, { nonce: 9n, digest: 'x', cancelledAt: 1n }, 1n);
+  assert.deepEqual(queue.listTasks().map((t) => t.seq), [0, 1, 2]);
+  assert.equal(queue.peekHead()!.id, a.id); // 队首仍是 a
+  assert.equal(queue.getTask(c.id)!.status, 'queued');
+});
+
+test('executeNext 越过队首/连续 cancelled，执行首个 queued；全为终态返回 null', () => {
+  const { queue, calls } = makeQueue();
+  const a = enq(queue, 0);
+  const b = enq(queue, 1);
+  const c = enq(queue, 2);
+  queue.cancel(a.id, { nonce: 9n, digest: 'x', cancelledAt: 1n }, 1n);
+  queue.cancel(b.id, { nonce: 10n, digest: 'y', cancelledAt: 1n }, 1n);
+  assert.equal(queue.executeNext(2n)!.id, c.id);
+  assert.deepEqual(calls, [c.id]);
+  assert.equal(queue.executeNext(3n), null);
+});
+
+test('executeTask 对 cancelled 任务直接返回终态（幂等），不调用执行器', () => {
+  const { queue, calls } = makeQueue();
+  const a = enq(queue, 0);
+  const cancelled = queue.cancel(a.id, { nonce: 9n, digest: 'x', cancelledAt: 1n }, 1n);
+  assert.equal(queue.execute(a.id, 2n), cancelled);
+  assert.deepEqual(calls, []);
+});
+
+test('取消不存在的 id → TaskNotFoundError；取消 executed/failed/cancelled → TaskCancellationConflict', () => {
+  const queue = new ExecutionQueue<any>(() => {
+    throw new PolicyConflict('drift');
+  });
+  const a = enq(queue, 0);
+  const b = enq(queue, 1);
+  const c = enq(queue, 2);
+  assert.throws(() => queue.cancel('nope', { nonce: 9n, digest: 'x', cancelledAt: 1n }, 1n), TaskNotFoundError);
+
+  // 独立队列取一个 executed 样本
+  const q2 = new ExecutionQueue<any>(() => ({ ok: 1 }));
+  const e = q2.enqueue({ nonce: 0n, digest: 'e', payload: {}, submittedAt: 1n });
+  q2.executeNext(1n);
+  assert.throws(() => q2.cancel(e.id, { nonce: 9n, digest: 'x', cancelledAt: 2n }, 2n), TaskCancellationConflict);
+
+  queue.executeNext(1n); // a → failed（执行器恒抛 PolicyConflict）
+  assert.equal(queue.getTask(a.id)!.status, 'failed');
+  assert.throws(() => queue.cancel(a.id, { nonce: 9n, digest: 'x', cancelledAt: 2n }, 2n), TaskCancellationConflict);
+
+  queue.cancel(b.id, { nonce: 9n, digest: 'x', cancelledAt: 2n }, 2n);
+  assert.throws(() => queue.cancel(b.id, { nonce: 10n, digest: 'y', cancelledAt: 3n }, 3n), TaskCancellationConflict);
+
+  // c 仍 queued，不受影响
+  assert.equal(queue.getTask(c.id)!.status, 'queued');
 });

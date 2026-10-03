@@ -1,10 +1,13 @@
 /**
  * 多签钱包策略引擎。
  *
- * 在阈值策略、签名收集、重放防护与 FIFO 执行队列之上，新增“策略变更任务”：
- * 所有者以当前阈值签名，决定替换所有者集合、确认数；任务入队，按既有排序/防重/
- * 终态规则执行；执行成功才原子替换策略并令版本递增一次，执行时版本漂移则
- * PolicyConflict 进入既有失败终态。
+ * 在阈值策略、签名收集、重放防护与 FIFO 执行队列之上：
+ * - “策略变更任务”：所有者以当前阈值签名，决定替换所有者集合、确认数；任务入队，按既有
+ *   排序/防重/终态规则执行；执行成功才原子替换策略并令版本递增一次，执行时版本漂移则
+ *   PolicyConflict 进入既有失败终态。
+ * - “任务取消”：当前所有者以当前阈值签名撤销尚未执行的任务。取消摘要使用独立域标签
+ *   safe-wallet/cancel/v1，绑定钱包标识、目标任务 digest、nonce、deadline；成功时目标
+ *   任务进入 cancelled 终态（不执行效果、不改 owners/确认数/版本），仅消费本次 nonce。
  */
 
 import {
@@ -15,18 +18,22 @@ import {
   recoverAddress,
 } from './crypto.ts';
 import {
+  hashCancellation,
   hashPolicyChange,
   hashTransaction,
   type PolicyChangeRequest,
   type TransactionRequest,
 } from './encoding.ts';
 import {
+  InvalidCancellation,
   InvalidPolicyChange,
   InvalidTransaction,
   NonceAlreadyUsedError,
   RequestExpired,
   PolicyConflict,
   InvalidQueueStateError,
+  TaskCancellationConflict,
+  TaskNotFoundError,
 } from './errors.ts';
 import { ExecutionQueue, type QueueTask } from './queue.ts';
 
@@ -79,6 +86,13 @@ export interface PolicyChangeSubmission {
   deadline: bigint | number;
   newOwners: string[];
   newConfirmations: bigint | number;
+}
+
+export interface CancellationSubmission {
+  /** 目标任务 id */
+  taskId: string;
+  nonce: bigint | number;
+  deadline: bigint | number;
 }
 
 function isNonNegativeInteger(n: bigint, maxBits = 256): boolean {
@@ -192,6 +206,70 @@ export class MultiSigWallet {
       },
       signatures,
     );
+  }
+
+  // ---------- 任务取消 ----------
+
+  /**
+   * 撤销一个尚未执行的任务（不要求在队首）。
+   *
+   * 取消本身也是一次需要阈值签名的操作，拥有自己的 nonce（与交易/策略变更共用同一序列）。
+   * 校验顺序固定，任一失败都不改变目标任务、不消费 nonce、不修改钱包策略：
+   *   1) nonce 复用 → NonceAlreadyUsedError（旧取消请求重放恒定得到此错误，即使已过期）
+   *   2) deadline 早于当前时间 → RequestExpired
+   *   3) 目标任务不存在 → TaskNotFoundError
+   *   4) 目标任务已是 executed/failed/cancelled → TaskCancellationConflict
+   *   5) 字段与阈值签名（safe-wallet/cancel/v1 摘要，绑定钱包/目标 digest/nonce/deadline）
+   *      不合法 → InvalidCancellation
+   * 全部通过后：目标任务进入 cancelled 终态，仅消费本次取消 nonce 并推进 expectedNonce。
+   */
+  cancelTask(sub: CancellationSubmission, signatures: readonly Uint8Array[]): WalletTask {
+    // (1) nonce：先于 deadline/目标查找，保证旧请求重放恒定报复用
+    const nonce = toBigInt(sub.nonce, InvalidCancellation, 'nonce');
+    if (!isNonNegativeInteger(nonce)) throw new InvalidCancellation('nonce must be a non-negative integer');
+    if (this.usedNonces.has(nonce)) throw new NonceAlreadyUsedError(nonce);
+
+    // (2) 截止时间
+    const deadline = toBigInt(sub.deadline, InvalidCancellation, 'deadline');
+    if (!isNonNegativeInteger(deadline)) throw new InvalidCancellation('deadline out of range');
+    if (deadline < this.now()) {
+      throw new RequestExpired(`cancellation deadline ${deadline} already passed`);
+    }
+
+    // (3) 目标任务必须存在
+    if (typeof sub.taskId !== 'string' || sub.taskId.length === 0) {
+      throw new InvalidCancellation('taskId must be a non-empty string');
+    }
+    const target = this.queue.getTask(sub.taskId);
+    if (target === null) throw new TaskNotFoundError(`task not found: ${sub.taskId}`);
+
+    // (4) 仅 queued 任务可取消；executed/failed/cancelled → 冲突
+    if (target.status !== 'queued') {
+      throw new TaskCancellationConflict(
+        `task ${sub.taskId} is already in terminal state ${target.status}`,
+      );
+    }
+
+    // (5) 取消摘要绑定钱包标识、目标任务 digest、nonce、deadline；阈值签名按“当前策略”核对
+    const digest = hashCancellation({
+      walletId: this.id,
+      taskDigest: target.digest,
+      nonce,
+      deadline,
+    });
+    this.verifyThresholdSignatures(digest, signatures, InvalidCancellation);
+
+    // (6) 原子生效：写入 cancelled 终态 + 消费取消 nonce（队列操作不会抛错）。
+    //     目标 payload/digest/nonce 原样保留，不执行目标效果，不动 owners/确认数/版本。
+    const at = this.now();
+    const cancelled = this.queue.cancel(
+      target.id,
+      { nonce, digest: digest.toString('hex'), cancelledAt: at },
+      at,
+    );
+    this.usedNonces.add(nonce);
+    this.nextNonce = nonce + 1n;
+    return cancelled;
   }
 
   // ---------- 执行 ----------
