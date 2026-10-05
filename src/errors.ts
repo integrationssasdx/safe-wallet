@@ -53,3 +53,29 @@ export class TaskCancellationConflict extends WalletError {}
 export class TaskNotFoundError extends WalletError {}
 
 export class InvalidQueueStateError extends WalletError {}
+
+// ---------- 普通交易分阶段审批 ----------
+
+/** 审批 id 不存在（创建 / 加签 / 查询 / 提交均抛此异常） */
+export class ApprovalNotFoundError extends WalletError {}
+
+/** 同一所有者对同一审批重复加签 */
+export class DuplicateApprovalSignatureError extends WalletError {}
+
+/** 审批签名格式非法（非 65 字节）、与摘要不符或签名者不是当前所有者 */
+export class InvalidApprovalSignatureError extends WalletError {}
+
+/** 审批截止时间已过（加签 / 提交时抛出；查询状态为 expired） */
+export class ApprovalExpiredError extends WalletError {}
+
+/** 审批创建后策略版本已漂移（加签 / 提交时抛出；查询状态为 conflicted；过期优先于此） */
+export class ApprovalPolicyConflictError extends WalletError {}
+
+/** 审批已完成提交（之后加签 / 重复提交抛出；查询状态为 submitted） */
+export class ApprovalAlreadySubmittedError extends WalletError {}
+
+/** 提交时收集到的去重签名数不足审批创建时的确认数 */
+export class ApprovalThresholdNotMetError extends WalletError {}
+
+/** 提交时审批绑定的 nonce 不等于当前 expectedNonce（尚未被消费但顺序不符） */
+export class ApprovalNonceConflictError extends WalletError {}

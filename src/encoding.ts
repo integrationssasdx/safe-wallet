@@ -2,10 +2,11 @@
  * 规范化编码与签名摘要。
  *
  * 各类操作使用不同的域分隔标签，签名互不兼容（任一类型的签名都不能用于其他类型）：
- *   - 普通交易：     "safe-wallet/tx/v1"
- *   - 原子批量交易： "safe-wallet/tx-batch/v1"
- *   - 策略变更：     "safe-wallet/policy-change/v1"
- *   - 任务取消：     "safe-wallet/cancel/v1"
+ *   - 普通交易：         "safe-wallet/tx/v1"
+ *   - 原子批量交易：     "safe-wallet/tx-batch/v1"
+ *   - 策略变更：         "safe-wallet/policy-change/v1"
+ *   - 任务取消：         "safe-wallet/cancel/v1"
+ *   - 普通交易分阶段审批："safe-wallet/tx-approval/v1"
  *
  * 编码规则（全部大端）：
  *   encBytes(b)  = uint32(len) || b
@@ -25,6 +26,7 @@ const TAG_TX = 'safe-wallet/tx/v1';
 const TAG_TX_BATCH = 'safe-wallet/tx-batch/v1';
 const TAG_POLICY_CHANGE = 'safe-wallet/policy-change/v1';
 const TAG_CANCEL = 'safe-wallet/cancel/v1';
+const TAG_TX_APPROVAL = 'safe-wallet/tx-approval/v1';
 
 // ---------- 编码原语 ----------
 
@@ -108,6 +110,17 @@ export interface CancellationRequest {
   taskDigest: string;
   nonce: bigint;
   deadline: bigint;
+}
+
+export interface TransactionApprovalRequest {
+  walletId: string;
+  /** 创建审批时绑定的当前策略版本 */
+  version: bigint;
+  nonce: bigint;
+  deadline: bigint;
+  to: Address;
+  value: bigint;
+  data: Uint8Array;
 }
 
 function walletIdBytes(walletId: string): Buffer {
@@ -199,5 +212,30 @@ export function hashCancellation(req: {
     encBytes(hexToBytes(req.taskDigest)),
     encUint(req.nonce),
     encUint(deadlineToBigint(req.deadline)),
+  ]);
+}
+
+/**
+ * 普通交易分阶段审批的签名摘要：绑定钱包标识、创建时的策略版本与完整交易字段
+ * （nonce、截止时间、收款地址、金额、data 副本）。与 safe-wallet/tx/v1 域不同，
+ * 审批签名与直接提交签名互不通用；版本漂移后旧审批签名自然失效（由引擎按版本拦截）。
+ */
+export function hashTransactionApproval(req: {
+  walletId: string;
+  version: bigint | number;
+  nonce: bigint | number;
+  deadline: bigint | number;
+  to: Address;
+  value: bigint | number;
+  data: Uint8Array;
+}): Buffer {
+  return digest(TAG_TX_APPROVAL, [
+    encBytes(walletIdBytes(req.walletId)),
+    encUint(req.version),
+    encUint(req.nonce),
+    encUint(deadlineToBigint(req.deadline)),
+    encBytes(hexToBytes(req.to)),
+    encUint(req.value),
+    encBytes(req.data),
   ]);
 }
