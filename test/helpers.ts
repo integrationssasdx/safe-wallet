@@ -1,5 +1,5 @@
-import { generateKeyPair, signDigest, sha256, type Address, type KeyPair } from '../src/crypto.ts';
-import { hashCancellation, hashPolicyChange, hashTransaction } from '../src/encoding.ts';
+import { generateKeyPair, signDigest, sha256, normalizeAddress, type Address, type KeyPair } from '../src/crypto.ts';
+import { hashCancellation, hashPolicyChange, hashTransaction, hashTransactionBatch } from '../src/encoding.ts';
 
 export interface Actor extends KeyPair {}
 
@@ -63,6 +63,50 @@ export interface PcParams {
   deadline: bigint;
   newOwners: Address[];
   newConfirmations: bigint;
+}
+
+export interface BatchCallParams {
+  to: Address;
+  value?: bigint;
+  data?: Uint8Array;
+}
+
+export interface BatchParams {
+  walletId: string;
+  nonce: bigint;
+  deadline: bigint;
+  calls: BatchCallParams[];
+}
+
+export function signTransactionBatch(
+  signers: Actor[],
+  p: BatchParams,
+  opts: { mutate?: (base: BatchParams) => BatchParams } = {},
+): Buffer[] {
+  const normalize = (calls: BatchCallParams[]) =>
+    calls.map((c) => ({
+      to: normalizeAddress(c.to) ?? c.to,
+      value: c.value ?? 0n,
+      data: c.data ?? new Uint8Array(),
+    }));
+  const base: BatchParams = {
+    walletId: p.walletId,
+    nonce: p.nonce,
+    deadline: p.deadline,
+    calls: p.calls.map((c) => ({
+      to: c.to,
+      value: c.value ?? 0n,
+      data: c.data ?? new Uint8Array(),
+    })),
+  };
+  const finalParams = opts.mutate ? opts.mutate(base) : base;
+  const digest = hashTransactionBatch({
+    walletId: finalParams.walletId,
+    nonce: finalParams.nonce,
+    deadline: finalParams.deadline,
+    calls: normalize(finalParams.calls),
+  });
+  return signers.map((s) => signDigest(s.privateKey, digest));
 }
 
 export function signPolicyChange(

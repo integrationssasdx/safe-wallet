@@ -1,7 +1,7 @@
 {
   "name": "safe-wallet",
   "version": "0.1.0",
-  "description": "多签钱包策略引擎：阈值策略、签名收集、重放防护、执行队列与策略变更任务",
+  "description": "多签钱包策略引擎：阈值策略、签名收集、重放防护、执行队列、策略变更任务、任务取消与原子批量普通交易",
   "type": "module",
   "private": true,
   "engines": {

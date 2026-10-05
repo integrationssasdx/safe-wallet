@@ -1,9 +1,11 @@
 /**
  * 规范化编码与签名摘要。
  *
- * 两类操作使用不同的域分隔标签，签名互不兼容（普通交易签名不能用于策略变更，反之亦然）：
+ * 四类操作使用不同的域分隔标签，签名互不兼容（任一操作的签名不能用于其他操作）：
  *   - 普通交易：   "safe-wallet/tx/v1"
+ *   - 批量交易：   "safe-wallet/tx-batch/v1"
  *   - 策略变更：   "safe-wallet/policy-change/v1"
+ *   - 任务取消：   "safe-wallet/cancel/v1"
  *
  * 编码规则（全部大端）：
  *   encBytes(b)  = uint32(len) || b
@@ -18,6 +20,7 @@
 import { sha256, hexToBytes, type Address } from './crypto.ts';
 
 const TAG_TX = 'safe-wallet/tx/v1';
+const TAG_TX_BATCH = 'safe-wallet/tx-batch/v1';
 const TAG_POLICY_CHANGE = 'safe-wallet/policy-change/v1';
 const TAG_CANCEL = 'safe-wallet/cancel/v1';
 
@@ -81,6 +84,22 @@ export interface PolicyChangeRequest {
   newConfirmations: bigint;
 }
 
+/** 批量交易中的单笔有序调用（摘要编码用；字段均已规范化） */
+export interface BatchCallDigest {
+  to: Address;
+  value: bigint;
+  data: Uint8Array;
+}
+
+export interface BatchTransactionRequest {
+  /** 钱包标识（部署时确定；参与签名绑定，防止跨钱包重放） */
+  walletId: string;
+  nonce: bigint;
+  deadline: bigint;
+  /** 有序调用列表：顺序与每一项内容都参与摘要，不得改变 */
+  calls: BatchCallDigest[];
+}
+
 export interface CancellationRequest {
   walletId: string;
   /** 目标任务的签名摘要（hex）：把取消请求绑定到唯一任务，防止改绑其他任务 */
@@ -114,6 +133,32 @@ export function hashTransaction(req: {
     encBytes(hexToBytes(req.to)),
     encUint(req.value),
     encBytes(req.data),
+  ]);
+}
+
+/**
+ * 原子批量交易的签名摘要（不含策略版本字段，与普通交易一致）。
+ * calls 按输入顺序逐项编码（收款方 || 金额 || data），再以 encList 加上数量前缀：
+ * 任一项的内容或项间顺序变化都会改变摘要。
+ */
+export function hashTransactionBatch(req: {
+  walletId: string;
+  nonce: bigint | number;
+  deadline: bigint | number;
+  calls: readonly { to: Address; value: bigint | number; data: Uint8Array }[];
+}): Buffer {
+  const encodedCalls = req.calls.map((call) =>
+    Buffer.concat([
+      encBytes(hexToBytes(call.to)),
+      encUint(call.value),
+      encBytes(call.data),
+    ]),
+  );
+  return digest(TAG_TX_BATCH, [
+    encBytes(walletIdBytes(req.walletId)),
+    encUint(req.nonce),
+    encUint(deadlineToBigint(req.deadline)),
+    encList(encodedCalls),
   ]);
 }
 
