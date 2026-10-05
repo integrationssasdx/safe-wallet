@@ -1,6 +1,7 @@
 # Safe Wallet
 
-多签钱包策略引擎：阈值策略、签名收集、重放防护、执行队列、策略变更任务，以及**任务取消**。
+多签钱包策略引擎：阈值策略、签名收集、重放防护、执行队列、策略变更任务、任务取消，以及
+**原子批量普通交易**。
 
 本仓库从零实现上述能力，不依赖任何外部同类实现或第三方密码学/以太坊库（仅使用 Node.js 内置的
 `node:crypto` 提供 SHA-256/HMAC 与随机数；secp256k1 点运算、RFC 6979 签名与公钥恢复均为内置实现）。
@@ -12,7 +13,7 @@
 
 ```bash
 npm install        # 仅安装类型检查所需的 devDependencies（typescript / @types/node）
-npm test           # 运行全部 81 项测试
+npm test           # 运行全部测试
 npm run typecheck  # 严格类型检查
 ```
 
@@ -25,17 +26,41 @@ npm run typecheck  # 严格类型检查
 | `owners` | 当前所有者地址集合（有序、唯一、非零地址） |
 | `confirmations` | 当前阈值（确认数），`1 <= confirmations <= owners.length` |
 | `version` | 当前策略版本，初始为 `1`，**每次成功执行策略变更恰好递增一次**（取消不递增） |
-| `nonce` 序列 | 普通交易、策略变更与取消**共用**的严格递增序列号，入队/生效即消费 |
+| `nonce` 序列 | 普通交易、批量交易、策略变更与取消**共用**的严格递增序列号，入队/生效即消费 |
 | 执行队列 | FIFO：只有队首可执行；任务有 `queued / executed / failed / cancelled` 四态，终态不可逆 |
 
-### 两类任务
+### 三类任务
 
 - **普通交易（transaction）**：收款方、金额、附带数据。其签名载荷**不包含策略版本字段**，
   与既有流程完全一致。
+- **原子批量普通交易（transaction-batch）**：一个有序调用列表（每项含收款地址、金额、
+  `Uint8Array` data），**非空且最多 64 项，顺序不得改变**。整批只入队一个队列任务、
+  只消费一个 nonce；成功执行整批产生一个 `transfer-batch` 回执，**不产生部分执行回执**。
 - **策略变更（policy-change）**：绑定提交时的当前策略版本、新所有者列表、新确认数、nonce、
   截止时间。执行成功时**原子地**同时替换所有者集合与确认数，并令版本递增一次。
 
-两类操作使用不同的域分隔标签，因此普通交易签名不能用于策略变更，反之亦然。
+各类操作使用不同的域分隔标签，因此单笔交易、批量交易、策略变更、取消的签名两两互不通用。
+
+### 原子批量普通交易
+
+`submitBatchTransaction` 接收 `{ nonce, deadline, calls }` 与签名数组。批量摘要使用独立域标签
+`safe-wallet/tx-batch/v1`，绑定**钱包标识、nonce、deadline 与按顺序编码的全部调用**
+（每调用固定按“收款地址 || 金额 || data”编码，再以数量前缀绑定项数与顺序）：
+
+- 单笔交易、策略变更、取消签名都**不能**授权批量交易，批量签名也不能授权单笔交易；
+- 任一调用的收款方、金额、data，或调用顺序、项数变化，都会改变摘要；
+- 金额、nonce、deadline 沿用既有非负整数口径（256 位以内）。
+
+校验顺序与单笔提交一致（查 nonce → 查 deadline → 校验内容与签名）。下列情形一律抛
+`InvalidTransactionBatch`，且**失败时不创建任务、不消费 nonce、不改变策略或队列**：
+列表为空或超过 64 项、收款地址非法或为零、数值越界、data 不是 `Uint8Array`、签名集合畸形、
+签名者非当前所有者、去重签名不足当前确认数。
+
+成功时只入队一个批量任务、只消费本次 nonce 并推进 `expectedNonce`，队列摘要防重继续生效。
+批量任务沿用同一 FIFO 队列：`executeTask` / `executeNext` 的选中规则、越序限制与终态幂等
+均不变；重复执行返回同一任务与同一回执。`cancelTask` 可取消尚未执行的批量任务，保留其
+payload、digest、nonce 及既有取消时间与摘要，不产生调用结果，不改变 owners、confirmations
+或 policyVersion。
 
 ### 任务取消
 
@@ -60,14 +85,15 @@ npm run typecheck  # 严格类型检查
 队列顺序；`executeTask` 对 cancelled 任务直接返回终态（不产生效果），`executeNext`
 越过队首或连续的 cancelled 任务执行首个 `queued` 任务，剩余全是终态时返回 `null`。
 
-## 提交流程（普通交易与策略变更共用）
+## 提交流程（普通交易、批量交易与策略变更共用）
 
 对每次提交，系统按顺序核对，任一失败都**不创建任务、不消费 nonce、不改变当前策略**：
 
-1. **nonce 复用** → 抛出 `NonceAlreadyUsedError`（既有重放防护的公开异常，两类操作共用）。
+1. **nonce 复用** → 抛出 `NonceAlreadyUsedError`（既有重放防护的公开异常，各类操作共用）。
 2. **截止时间早于当前时间** → 抛出 `RequestExpired`。
 3. **字段 / 版本 / nonce 顺序 / 签名** →
    - 普通交易：`InvalidTransaction`
+   - 批量交易：`InvalidTransactionBatch`
    - 策略变更：`InvalidPolicyChange`
 4. 全部通过后：计算签名摘要 → 恢复签名者 → 地址去重 → 校验签名者均为**当前所有者**且
    去重后的数量达到**当前确认数** → 入队并消费 nonce。
@@ -90,6 +116,9 @@ npm run typecheck  # 严格类型检查
   队首（或连续）的 `cancelled` 任务视为已越过：`executeNext` 执行首个 `queued` 任务，
   剩余全是终态时返回 `null`。
 - **普通交易**：执行产出转账结果（收款方/金额/数据），不触碰策略状态。
+- **批量交易**：整批一次性执行并产出**一个** `transfer-batch` 回执，`calls` 按输入顺序给出
+  规范化收款地址、原金额与十六进制 data；不会逐调用产出部分执行回执（回调正常返回才写
+  executed，抛出则整批 failed）。同样不触碰策略状态。
 - **策略变更**：
   - 执行的生效条件是穷尽的：**任务绑定版本仍等于当前版本，且队列允许执行（队首）**。
   - 若执行时绑定版本 **≠ 当前版本**（执行前策略已被别的任务改变）→ 任务进入 `failed`
@@ -111,6 +140,7 @@ npm run typecheck  # 严格类型检查
 | 错误 | 触发时机 |
 | --- | --- |
 | `InvalidTransaction` | 普通交易字段、nonce 顺序或签名不合法 |
+| `InvalidTransactionBatch` | 批量交易列表（空/超 64 项）、调用字段（地址/金额/data）、nonce 顺序或签名不合法 |
 | `InvalidPolicyChange` | 策略变更字段、版本（提交时）、nonce 顺序或签名不合法 |
 | `InvalidCancellation` | 取消请求字段、nonce 顺序或签名不合法 |
 | `TaskCancellationConflict` | 取消目标已处于终态（executed / failed / cancelled） |
@@ -137,6 +167,8 @@ digest = sha256( encStr(domainTag) || 各字段 )
 ```
 
 - 普通交易域标签：`safe-wallet/tx/v1`，字段为钱包标识、nonce、截止时间、收款方、金额、数据。
+- 批量交易域标签：`safe-wallet/tx-batch/v1`，字段为钱包标识、nonce、截止时间、调用列表
+  （`encList`；每个调用固定编码为收款地址、金额、data 三段，顺序即列表顺序）。
 - 策略变更域标签：`safe-wallet/policy-change/v1`，字段为钱包标识、版本、nonce、截止时间、
   新确认数、新所有者列表。
 - 任务取消域标签：`safe-wallet/cancel/v1`，字段为钱包标识、目标任务 digest、nonce、截止时间。
@@ -154,12 +186,12 @@ digest = sha256( encStr(domainTag) || 各字段 )
 ```
 src/
   crypto.ts    secp256k1 点运算 / RFC6979 签名 / 公钥恢复 / 地址 / SHA-256
-  encoding.ts  规范化长度前缀编码与两类操作的签名摘要
+  encoding.ts  规范化长度前缀编码与各类操作（含批量交易）的签名摘要
   errors.ts    公开错误类型
   queue.ts     FIFO 执行队列（排序、终态、幂等、digest 防重）
-  wallet.ts    多签钱包引擎（阈值、签名收集、nonce、提交校验、策略应用）
+  wallet.ts    多签钱包引擎（阈值、签名收集、nonce、提交校验、批量、策略应用）
   index.ts     统一导出
-test/          node:test 测试（密码学、编码、队列、提交、执行、对抗输入）
+test/          node:test 测试（密码学、编码、队列、提交、执行、批量、取消、对抗输入）
 ```
 
 ## 最小示例
@@ -199,6 +231,32 @@ done.status;                 // 'executed'
 wallet.policyVersion;        // 2n
 wallet.requiredConfirmations; // 1n
 wallet.currentOwners;        // [a.address, newbie.address]
+```
+
+### 原子批量普通交易
+
+```ts
+import { hashTransactionBatch } from './src/encoding.ts';
+
+const calls = [
+  { to: b.address, value: 100n, data: new Uint8Array() },
+  { to: c.address, value: 200n, data: Buffer.from('calldata') },
+];
+const digest = hashTransactionBatch({
+  walletId: 'wallet-1',
+  nonce: wallet.expectedNonce, // 整批一个 nonce
+  deadline: 5000n,
+  calls,
+});
+const sigs = [a, b].map((k) => signDigest(k.privateKey, digest));
+
+const batchTask = wallet.submitBatchTransaction(
+  { nonce: 0n, deadline: 5000n, calls },
+  sigs,
+);
+const executed = wallet.executeTask(batchTask.id);
+(executed.receipt!.result as { kind: string }).kind; // 'transfer-batch'
+// result.calls 按输入顺序给出 { to, value, data(hex) }；整批只有这一个回执
 ```
 
 ## 约定

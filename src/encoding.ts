@@ -1,9 +1,11 @@
 /**
  * 规范化编码与签名摘要。
  *
- * 两类操作使用不同的域分隔标签，签名互不兼容（普通交易签名不能用于策略变更，反之亦然）：
- *   - 普通交易：   "safe-wallet/tx/v1"
- *   - 策略变更：   "safe-wallet/policy-change/v1"
+ * 各类操作使用不同的域分隔标签，签名互不兼容（任一类型的签名都不能用于其他类型）：
+ *   - 普通交易：     "safe-wallet/tx/v1"
+ *   - 原子批量交易： "safe-wallet/tx-batch/v1"
+ *   - 策略变更：     "safe-wallet/policy-change/v1"
+ *   - 任务取消：     "safe-wallet/cancel/v1"
  *
  * 编码规则（全部大端）：
  *   encBytes(b)  = uint32(len) || b
@@ -12,12 +14,15 @@
  *   encList(xs)  = uint32(count) || concat(encBytes(x))
  *
  * 普通交易载荷不包含策略版本字段（保持既有交易格式不变）；
+ * 批量交易载荷绑定钱包标识、nonce、截止时间，以及按顺序编码的全部调用
+ * （每调用固定按“收款地址 || 金额 || data”编码，再以 encList 绑定项数与顺序）；
  * 策略变更载荷显式绑定钱包标识、操作标签、当前版本、新所有者、新确认数、nonce、截止时间。
  */
 
 import { sha256, hexToBytes, type Address } from './crypto.ts';
 
 const TAG_TX = 'safe-wallet/tx/v1';
+const TAG_TX_BATCH = 'safe-wallet/tx-batch/v1';
 const TAG_POLICY_CHANGE = 'safe-wallet/policy-change/v1';
 const TAG_CANCEL = 'safe-wallet/cancel/v1';
 
@@ -81,6 +86,22 @@ export interface PolicyChangeRequest {
   newConfirmations: bigint;
 }
 
+/** 批量交易中的单次调用：收款地址、金额、附带数据 */
+export interface BatchTransactionCall {
+  to: Address;
+  value: bigint;
+  data: Uint8Array;
+}
+
+export interface TransactionBatchRequest {
+  /** 钱包标识（部署时确定；参与签名绑定，防止跨钱包重放） */
+  walletId: string;
+  nonce: bigint;
+  deadline: bigint;
+  /** 有序调用列表（1..64 项）；顺序参与签名，不得改变 */
+  calls: BatchTransactionCall[];
+}
+
 export interface CancellationRequest {
   walletId: string;
   /** 目标任务的签名摘要（hex）：把取消请求绑定到唯一任务，防止改绑其他任务 */
@@ -114,6 +135,36 @@ export function hashTransaction(req: {
     encBytes(hexToBytes(req.to)),
     encUint(req.value),
     encBytes(req.data),
+  ]);
+}
+
+/**
+ * 原子批量普通交易的签名摘要：绑定钱包标识、nonce、截止时间，以及按顺序编码的全部调用。
+ * 每个调用固定按“收款地址 || 金额 || data”编码为一段，再以 encList 绑定项数与顺序：
+ * 任一调用的收款方/金额/data 变化，或调用顺序/项数变化，都会改变摘要。
+ */
+export function hashTransactionBatch(req: {
+  walletId: string;
+  nonce: bigint | number;
+  deadline: bigint | number;
+  calls: readonly {
+    to: Address;
+    value: bigint | number;
+    data: Uint8Array;
+  }[];
+}): Buffer {
+  const encodedCalls = req.calls.map((call) =>
+    Buffer.concat([
+      encBytes(hexToBytes(call.to)),
+      encUint(call.value),
+      encBytes(call.data),
+    ]),
+  );
+  return digest(TAG_TX_BATCH, [
+    encBytes(walletIdBytes(req.walletId)),
+    encUint(req.nonce),
+    encUint(deadlineToBigint(req.deadline)),
+    encList(encodedCalls),
   ]);
 }
 

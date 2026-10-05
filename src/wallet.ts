@@ -1,10 +1,12 @@
 /**
  * 多签钱包策略引擎。
  *
- * 在阈值策略、签名收集、重放防护、FIFO 执行队列与策略变更任务之上，新增“任务取消”：
- * 当前所有者以阈值签名（safe-wallet/cancel/v1 域，绑定钱包标识、目标任务 digest、nonce、
- * 截止时间）撤销尚未执行的 queued 任务；目标任务进入 cancelled 终态（保留原 payload/
- * digest/nonce，记录取消时间与摘要），不执行其效果、不改变策略、只消费本次 nonce。
+ * 在阈值策略、签名收集、重放防护、FIFO 执行队列、策略变更任务与任务取消之上，新增
+ * “原子批量普通交易”：当前所有者以阈值签名（safe-wallet/tx-batch/v1 域，绑定钱包标识、
+ * nonce、截止时间与按顺序编码的全部调用）提交一个有序调用列表（1..64 项）。
+ * 批量任务只入队一个队列任务、只消费一个 nonce；执行时整批成功产生一个 transfer-batch
+ * 回执（不产生部分执行回执），失败则整批不生效。批量任务沿用同一 FIFO 队列、取消语义与
+ * 终态幂等；单笔交易 / 策略变更 / 取消签名均不能授权批量交易。
  */
 
 import {
@@ -18,13 +20,16 @@ import {
   hashCancellation,
   hashPolicyChange,
   hashTransaction,
+  hashTransactionBatch,
   type PolicyChangeRequest,
+  type TransactionBatchRequest,
   type TransactionRequest,
 } from './encoding.ts';
 import {
   InvalidCancellation,
   InvalidPolicyChange,
   InvalidTransaction,
+  InvalidTransactionBatch,
   NonceAlreadyUsedError,
   RequestExpired,
   PolicyConflict,
@@ -45,6 +50,12 @@ export type WalletTaskPayload =
       data: Uint8Array;
     }
   | {
+      kind: 'transaction-batch';
+      deadline: bigint;
+      /** 有序调用；顺序即执行顺序，执行回执按同一顺序给出 */
+      calls: BatchCall[];
+    }
+  | {
       kind: 'policy-change';
       deadline: bigint;
       /** 提交时绑定的策略版本；执行时必须仍等于当前版本 */
@@ -52,6 +63,13 @@ export type WalletTaskPayload =
       newOwners: Address[];
       newConfirmations: bigint;
     };
+
+/** 批量任务内的单次调用（规范化后的收款地址、原金额、原始 data 副本） */
+export interface BatchCall {
+  to: Address;
+  value: bigint;
+  data: Uint8Array;
+}
 
 export type WalletTask = QueueTask<WalletTaskPayload>;
 
@@ -91,6 +109,24 @@ export interface CancellationSubmission {
   nonce: bigint | number;
   deadline: bigint | number;
 }
+
+/** 批量提交中的单次调用（原始输入；地址在校验时规范化） */
+export interface BatchCallSubmission {
+  to: string;
+  value: bigint | number;
+  /** 必含的调用数据（允许零长度）；必须是 Uint8Array */
+  data: Uint8Array;
+}
+
+export interface BatchTransactionSubmission {
+  nonce: bigint | number;
+  deadline: bigint | number;
+  /** 有序调用列表：非空且最多 MAX_BATCH_CALLS 项，顺序参与签名且不得改变 */
+  calls: readonly BatchCallSubmission[];
+}
+
+/** 批量交易调用数量上限（含） */
+export const MAX_BATCH_CALLS = 64;
 
 function isNonNegativeInteger(n: bigint, maxBits = 256): boolean {
   return n >= 0n && n < 2n ** BigInt(maxBits);
@@ -184,6 +220,34 @@ export class MultiSigWallet {
         to: sub.to,
         value: sub.value,
         data: sub.data ?? new Uint8Array(),
+      },
+      signatures,
+    );
+  }
+
+  // ---------- 原子批量普通交易提交 ----------
+
+  /**
+   * 提交一个有序调用列表作为单个原子批量任务。
+   *
+   * 摘要使用 safe-wallet/tx-batch/v1 域标签，绑定钱包标识、nonce、截止时间与按顺序编码的
+   * 全部调用：单笔交易 / 策略变更 / 取消签名都不能授权批量交易；任一调用的收款方、金额、
+   * data 或调用顺序、项数变化都会改变摘要。
+   *
+   * 校验顺序与单笔提交一致（任一失败都不建任务、不消费 nonce、不改策略/队列）：
+   *   1) nonce 复用 → NonceAlreadyUsedError（旧请求重放恒得此异常，即使已过期）
+   *   2) deadline 早于当前时间 → RequestExpired
+   *   3) 列表（1..64 项）、收款地址、金额、data、nonce 顺序、阈值签名 → InvalidTransactionBatch
+   *
+   * 成功时只入队一个批量任务、只消费本次 nonce 并推进 expectedNonce。
+   */
+  submitBatchTransaction(sub: BatchTransactionSubmission, signatures: readonly Uint8Array[]): WalletTask {
+    return this.submit(
+      'transaction-batch',
+      {
+        nonce: sub.nonce,
+        deadline: sub.deadline,
+        calls: sub.calls,
       },
       signatures,
     );
@@ -319,7 +383,12 @@ export class MultiSigWallet {
     raw: Record<string, unknown>,
     signatures: readonly Uint8Array[],
   ): WalletTask {
-    const Invalid = kind === 'policy-change' ? InvalidPolicyChange : InvalidTransaction;
+    const Invalid =
+      kind === 'policy-change'
+        ? InvalidPolicyChange
+        : kind === 'transaction-batch'
+          ? InvalidTransactionBatch
+          : InvalidTransaction;
 
     // 校验优先级（任一失败都不建任务、不消费 nonce、不改策略）：
     //   1) nonce 复用 → 既有重放防护的公开异常（旧请求重放即使已过期也仍报复用）
@@ -363,6 +432,17 @@ export class MultiSigWallet {
       };
       digest = hashTransaction(req);
       payload = { kind: 'transaction', deadline, to, value, data };
+    } else if (kind === 'transaction-batch') {
+      // 有序调用列表：1..64 项；逐项规范化收款地址、金额与 data（顺序保持不变）
+      const calls = this.normalizeBatchCalls(raw.calls);
+      const req: TransactionBatchRequest = {
+        walletId: this.id,
+        nonce,
+        deadline,
+        calls,
+      };
+      digest = hashTransactionBatch(req);
+      payload = { kind: 'transaction-batch', deadline, calls };
     } else {
       const version = toBigInt(raw.version, InvalidPolicyChange, 'version');
       // (3a) 版本必须绑定当前版本（提交时不匹配 → InvalidPolicyChange；执行时漂移 → PolicyConflict）
@@ -413,6 +493,41 @@ export class MultiSigWallet {
     return task;
   }
 
+  /**
+   * 规范化批量调用列表：必须是 1..MAX_BATCH_CALLS 项的数组，每项是对象，
+   * 收款地址合法且非零、金额为 256 位以内非负整数、data 必须是 Uint8Array。
+   * 保持输入顺序；任何畸形都归为 InvalidTransactionBatch。
+   */
+  private normalizeBatchCalls(rawCalls: unknown): BatchCall[] {
+    if (!Array.isArray(rawCalls) || rawCalls.length === 0) {
+      throw new InvalidTransactionBatch('calls must be a non-empty array');
+    }
+    if (rawCalls.length > MAX_BATCH_CALLS) {
+      throw new InvalidTransactionBatch(`too many calls: ${rawCalls.length} > ${MAX_BATCH_CALLS}`);
+    }
+    const calls: BatchCall[] = [];
+    for (const rawCall of rawCalls) {
+      if (typeof rawCall !== 'object' || rawCall === null) {
+        throw new InvalidTransactionBatch('each batch call must be an object');
+      }
+      const call = rawCall as Record<string, unknown>;
+      const to = normalizeAddress(call.to as string);
+      if (to === null || isZeroAddress(to)) {
+        throw new InvalidTransactionBatch('invalid or zero recipient address in batch call');
+      }
+      const value = toBigInt(call.value, InvalidTransactionBatch, 'value');
+      if (!isNonNegativeInteger(value)) {
+        throw new InvalidTransactionBatch('batch call value out of range');
+      }
+      if (!(call.data instanceof Uint8Array)) {
+        throw new InvalidTransactionBatch('batch call data must be a Uint8Array');
+      }
+      // 复制一份，避免入队后调用方再改动同一缓冲区影响任务内容/摘要
+      calls.push({ to, value, data: Buffer.from(call.data) });
+    }
+    return calls;
+  }
+
   /** 按“当前策略”的所有者集合与确认数校验签名收集 */
   private verifyThresholdSignatures(
     digest: Uint8Array,
@@ -444,7 +559,7 @@ export class MultiSigWallet {
     }
   }
 
-  /** 队列执行器回调：定义两类任务的生效语义 */
+  /** 队列执行器回调：定义各类任务的生效语义 */
   private applyTask(task: WalletTask): unknown {
     const p = task.payload;
     if (p.kind === 'transaction') {
@@ -455,6 +570,20 @@ export class MultiSigWallet {
         to: p.to,
         value: p.value,
         data: Buffer.from(p.data).toString('hex'),
+      };
+    }
+
+    if (p.kind === 'transaction-batch') {
+      // 原子批量：执行器一次性产出整批回执。调用方（队列）在本回调正常返回后才写入
+      // executed 终态；本回调抛出则整批进入 failed，不产生部分执行回执。
+      // 截止时间同样不是执行闸门，与单笔普通交易保持一致。
+      return {
+        kind: 'transfer-batch',
+        calls: p.calls.map((call) => ({
+          to: call.to,
+          value: call.value,
+          data: Buffer.from(call.data).toString('hex'),
+        })),
       };
     }
 

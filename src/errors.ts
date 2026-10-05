@@ -18,6 +18,13 @@ export class WalletError extends Error {
 /** 普通交易提交参数或签名不合法 */
 export class InvalidTransaction extends WalletError {}
 
+/**
+ * 原子批量普通交易提交不合法（不建任务、不消费 nonce、不改策略/队列）：
+ * 列表为空或超过 64 项、收款地址非法或为零、金额越界、data 不是 Uint8Array、
+ * 签名集合畸形、签名者非当前所有者、去重签名不足当前确认数。
+ */
+export class InvalidTransactionBatch extends WalletError {}
+
 /** 策略变更字段、版本、签名或 nonce 顺序不合法（不建任务、不消费 nonce、不改策略） */
 export class InvalidPolicyChange extends WalletError {}
 
