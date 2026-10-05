@@ -3,6 +3,7 @@
  *
  * 各类操作使用不同的域分隔标签，签名互不兼容（任一类型的签名都不能用于其他类型）：
  *   - 普通交易：     "safe-wallet/tx/v1"
+ *   - 普通交易审批： "safe-wallet/tx-approval/v1"
  *   - 原子批量交易： "safe-wallet/tx-batch/v1"
  *   - 策略变更：     "safe-wallet/policy-change/v1"
  *   - 任务取消：     "safe-wallet/cancel/v1"
@@ -14,6 +15,9 @@
  *   encList(xs)  = uint32(count) || concat(encBytes(x))
  *
  * 普通交易载荷不包含策略版本字段（保持既有交易格式不变）；
+ * 分阶段签名收集的审批载荷使用独立域标签 safe-wallet/tx-approval/v1，绑定钱包标识、
+ * 创建时策略版本、nonce、截止时间与完整交易字段（收款地址、金额、data 副本），
+ * 与普通交易摘要互不通用（任一类型签名都不能用于另一类型）；
  * 批量交易载荷绑定钱包标识、nonce、截止时间，以及按顺序编码的全部调用
  * （每调用固定按“收款地址 || 金额 || data”编码，再以 encList 绑定项数与顺序）；
  * 策略变更载荷显式绑定钱包标识、操作标签、当前版本、新所有者、新确认数、nonce、截止时间。
@@ -22,6 +26,7 @@
 import { sha256, hexToBytes, type Address } from './crypto.ts';
 
 const TAG_TX = 'safe-wallet/tx/v1';
+const TAG_TX_APPROVAL = 'safe-wallet/tx-approval/v1';
 const TAG_TX_BATCH = 'safe-wallet/tx-batch/v1';
 const TAG_POLICY_CHANGE = 'safe-wallet/policy-change/v1';
 const TAG_CANCEL = 'safe-wallet/cancel/v1';
@@ -102,6 +107,18 @@ export interface TransactionBatchRequest {
   calls: BatchTransactionCall[];
 }
 
+/** 普通交易分阶段签名收集（审批）请求：独立域标签，比普通交易摘要多绑定创建时版本 */
+export interface TransactionApprovalRequest {
+  walletId: string;
+  /** 创建审批时绑定的当前策略版本；加签 / 提交时若已漂移则审批作废 */
+  version: bigint;
+  nonce: bigint;
+  deadline: bigint;
+  to: Address;
+  value: bigint;
+  data: Uint8Array;
+}
+
 export interface CancellationRequest {
   walletId: string;
   /** 目标任务的签名摘要（hex）：把取消请求绑定到唯一任务，防止改绑其他任务 */
@@ -130,6 +147,32 @@ export function hashTransaction(req: {
 }): Buffer {
   return digest(TAG_TX, [
     encBytes(walletIdBytes(req.walletId)),
+    encUint(req.nonce),
+    encUint(deadlineToBigint(req.deadline)),
+    encBytes(hexToBytes(req.to)),
+    encUint(req.value),
+    encBytes(req.data),
+  ]);
+}
+
+/**
+ * 普通交易分阶段签名收集（审批）的签名摘要：safe-wallet/tx-approval/v1 独立域标签，
+ * 绑定钱包标识、创建时策略版本、nonce、截止时间与完整交易字段（收款地址、金额、data）。
+ * 与 safe-wallet/tx/v1 摘要互不通用：普通交易签名不能用于审批加签，反之亦然；
+ * 钱包、版本、nonce、截止时间或任一交易字段变化都会改变摘要。
+ */
+export function hashTransactionApproval(req: {
+  walletId: string;
+  version: bigint | number;
+  nonce: bigint | number;
+  deadline: bigint | number;
+  to: Address;
+  value: bigint | number;
+  data: Uint8Array;
+}): Buffer {
+  return digest(TAG_TX_APPROVAL, [
+    encBytes(walletIdBytes(req.walletId)),
+    encUint(req.version),
     encUint(req.nonce),
     encUint(deadlineToBigint(req.deadline)),
     encBytes(hexToBytes(req.to)),

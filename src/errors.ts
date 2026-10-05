@@ -53,3 +53,42 @@ export class TaskCancellationConflict extends WalletError {}
 export class TaskNotFoundError extends WalletError {}
 
 export class InvalidQueueStateError extends WalletError {}
+
+// ---------- 普通交易分阶段签名收集（审批） ----------
+
+/** 审批不存在（未知 id；或从未创建） */
+export class ApprovalNotFoundError extends WalletError {}
+
+/**
+ * 同一当前所有者对同一审批重复加签。
+ * 签名格式错误、摘要不符或签名者不是当前所有者用 InvalidApprovalSignatureError。
+ */
+export class DuplicateApprovalSignatureError extends WalletError {}
+
+/** 加签内容不合法：不是 65 字节签名、恢复失败、摘要不匹配，或签名者不是当前所有者 */
+export class InvalidApprovalSignatureError extends WalletError {}
+
+/** 审批已过截止时间（过期优先于版本漂移判定） */
+export class ApprovalExpiredError extends WalletError {}
+
+/** 审批绑定的策略版本已漂移（加签 / 提交时当前版本不同于创建时版本） */
+export class ApprovalPolicyConflictError extends WalletError {}
+
+/** 审批已提交入队，不可再加签或重复提交 */
+export class ApprovalAlreadySubmittedError extends WalletError {}
+
+/** 提交时去重后的当前所有者签名数仍未达到当前确认数 */
+export class ApprovalThresholdNotMetError extends WalletError {}
+
+/** 提交时审批预留 nonce 已不等于 expectedNonce（被其他提交插队消费） */
+export class ApprovalNonceConflictError extends WalletError {
+  readonly approvalNonce: bigint;
+  readonly expectedNonce: bigint;
+  constructor(approvalNonce: bigint, expectedNonce: bigint) {
+    super(
+      `approval nonce ${approvalNonce} no longer matches expected nonce ${expectedNonce}`,
+    );
+    this.approvalNonce = approvalNonce;
+    this.expectedNonce = expectedNonce;
+  }
+}

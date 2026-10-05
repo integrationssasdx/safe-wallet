@@ -1,5 +1,11 @@
 import { generateKeyPair, signDigest, sha256, type Address, type KeyPair } from '../src/crypto.ts';
-import { hashCancellation, hashPolicyChange, hashTransaction, hashTransactionBatch } from '../src/encoding.ts';
+import {
+  hashCancellation,
+  hashPolicyChange,
+  hashTransaction,
+  hashTransactionApproval,
+  hashTransactionBatch,
+} from '../src/encoding.ts';
 
 export interface Actor extends KeyPair {}
 
@@ -49,6 +55,41 @@ export function signTransaction(
   };
   const finalParams = opts.mutate ? opts.mutate(base) : base;
   const digest = hashTransaction({
+    ...finalParams,
+    value: finalParams.value ?? 0n,
+    data: finalParams.data ?? new Uint8Array(),
+  });
+  return signers.map((s) => signDigest(s.privateKey, digest));
+}
+
+export interface ApprovalParams {
+  walletId: string;
+  /** 创建审批时绑定的策略版本 */
+  version: bigint;
+  nonce: bigint;
+  deadline: bigint;
+  to: Address;
+  value?: bigint;
+  data?: Uint8Array;
+}
+
+/** 对 safe-wallet/tx-approval/v1 审批摘要签名（分阶段收集，每次一个签名时取单个元素） */
+export function signTransactionApproval(
+  signers: Actor[],
+  p: ApprovalParams,
+  opts: { mutate?: (base: ApprovalParams) => ApprovalParams } = {},
+): Buffer[] {
+  const base: ApprovalParams = {
+    walletId: p.walletId,
+    version: p.version,
+    nonce: p.nonce,
+    deadline: p.deadline,
+    to: p.to,
+    value: p.value ?? 0n,
+    data: p.data ?? new Uint8Array(),
+  };
+  const finalParams = opts.mutate ? opts.mutate(base) : base;
+  const digest = hashTransactionApproval({
     ...finalParams,
     value: finalParams.value ?? 0n,
     data: finalParams.data ?? new Uint8Array(),

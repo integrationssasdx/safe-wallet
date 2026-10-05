@@ -1,7 +1,7 @@
 # Safe Wallet
 
-多签钱包策略引擎：阈值策略、签名收集、重放防护、执行队列、策略变更任务、任务取消，以及
-**原子批量普通交易**。
+多签钱包策略引擎：阈值策略、签名收集、重放防护、执行队列、策略变更任务、任务取消、
+**原子批量普通交易**，以及**普通交易分阶段签名收集（审批）**。
 
 本仓库从零实现上述能力，不依赖任何外部同类实现或第三方密码学/以太坊库（仅使用 Node.js 内置的
 `node:crypto` 提供 SHA-256/HMAC 与随机数；secp256k1 点运算、RFC 6979 签名与公钥恢复均为内置实现）。
@@ -61,6 +61,40 @@ npm run typecheck  # 严格类型检查
 均不变；重复执行返回同一任务与同一回执。`cancelTask` 可取消尚未执行的批量任务，保留其
 payload、digest、nonce 及既有取消时间与摘要，不产生调用结果，不改变 owners、confirmations
 或 policyVersion。
+
+### 普通交易分阶段签名收集（审批）
+
+普通交易除了旧的一次性提交入口外，还可以先登记、再由当前所有者**逐个追加签名**，阈值满足
+后统一提交。审批使用独立域标签 `safe-wallet/tx-approval/v1`，与 `safe-wallet/tx/v1`
+**新旧摘要互不通用**：旧入口的交易签名不能用于加签，审批签名也不能用于旧入口。
+
+- `createTransactionApproval({ nonce, deadline, to, value, data? })`：按普通交易字段口径校验，
+  记录**钱包标识、创建时策略版本、nonce、截止时间与完整交易字段**（data 入库前复制一份）。
+  **不消费 nonce、不入队、不建任务、不改策略**。返回审批视图：审批标识 `id`、审批摘要
+  `digest`（hex）、`version`、`confirmations`、`nonce`、交易字段、有序 `signers` 与状态
+  （签名不足时 `collecting`，达到当前确认数时 `ready`）。同一审批摘要重复登记幂等返回同一条。
+  创建失败的错误与旧入口一致：字段非法或 nonce 跳号（≠ `expectedNonce`）→
+  `InvalidTransaction`，nonce 已用 → `NonceAlreadyUsedError`（优先于过期），
+  已过期 → `RequestExpired`；失败不消费 nonce、不建任务、不改策略。
+- `addApprovalSignature(id, signature)`：每次追加一个 65 字节签名。签名必须针对创建时的
+  tx-approval 摘要，且恢复出的签名者是**当前所有者**。同一所有者再签 →
+  `DuplicateApprovalSignatureError`；签名长度/格式错误、摘要不符、签名者非当前所有者 →
+  `InvalidApprovalSignatureError`。去重签名者数达到当前确认数即转 `ready`（之后仍可继续加签）。
+- `getTransactionApproval(id)`：返回审批当前状态与**按加签先后排序的去重签名者**。
+  状态按查询时刻计算：`submitted` / `expired` / `conflicted` / `ready` / `collecting`。
+- `submitApprovedTransaction(id)`：阈值满足后，按**既有 `safe-wallet/tx/v1` 摘要**入队一个
+  普通交易任务（payload、FIFO、取消语义、执行回执与终态幂等与旧入口完全一致），
+  **只消费创建时预留的 nonce**。
+
+加签与提交的前置判定顺序为：未知 id → `ApprovalNotFoundError`；已提交 →
+`ApprovalAlreadySubmittedError`；已过截止时间 → `ApprovalExpiredError`（**过期优先**于版本
+漂移）；当前版本 ≠ 创建时版本 → `ApprovalPolicyConflictError`。提交在此之后继续核对：
+
+1. 去重后的**当前所有者**签名数不足当前确认数 → `ApprovalThresholdNotMetError`；
+2. 创建时 nonce 已被其他入口消费 → `NonceAlreadyUsedError`；
+3. 创建时 nonce ≠ `expectedNonce`（被其他 nonce 插队）→ `ApprovalNonceConflictError`。
+
+任一失败都不入队、不消费 nonce、不改策略。提交成功后审批进入 `submitted`，返回 `WalletTask`。
 
 ### 任务取消
 
@@ -149,6 +183,14 @@ payload、digest、nonce 及既有取消时间与摘要，不产生调用结果�
 | `NonceAlreadyUsedError` | nonce 已被使用（公开重放异常，含 `.usedNonce`） |
 | `TaskNotFoundError` | 执行/查询不存在的任务 id |
 | `InvalidQueueStateError` | 跳过队首执行等非法队列操作 |
+| `ApprovalNotFoundError` | 审批 id 未知（查询 / 加签 / 提交） |
+| `DuplicateApprovalSignatureError` | 同一当前所有者对同一审批重复加签 |
+| `InvalidApprovalSignatureError` | 审批加签不是 65 字节、恢复失败、摘要不符或签名者非当前所有者 |
+| `ApprovalExpiredError` | 审批已过截止时间时加签 / 提交（过期优先于版本漂移） |
+| `ApprovalPolicyConflictError` | 审批创建时版本已漂移时加签 / 提交 |
+| `ApprovalAlreadySubmittedError` | 审批已提交后再加签或重复提交 |
+| `ApprovalThresholdNotMetError` | 提交审批时去重签名者不足当前确认数 |
+| `ApprovalNonceConflictError` | 提交审批时创建时 nonce ≠ `expectedNonce`（含 `.approvalNonce` / `.expectedNonce`） |
 
 提交路径对任意畸形输入（`undefined`、非数字字符串、小数、超大整数、畸形签名集合等）都只会
 抛出上表中的约定错误，不会泄漏原生 `TypeError`/`RangeError`。
@@ -167,6 +209,8 @@ digest = sha256( encStr(domainTag) || 各字段 )
 ```
 
 - 普通交易域标签：`safe-wallet/tx/v1`，字段为钱包标识、nonce、截止时间、收款方、金额、数据。
+- 普通交易审批域标签：`safe-wallet/tx-approval/v1`，字段为钱包标识、**创建时版本**、nonce、
+  截止时间、收款方、金额、数据（与 tx/v1 仅差一个版本字段且域标签不同，故两域摘要互不通用）。
 - 批量交易域标签：`safe-wallet/tx-batch/v1`，字段为钱包标识、nonce、截止时间、调用列表
   （`encList`；每个调用固定编码为收款地址、金额、data 三段，顺序即列表顺序）。
 - 策略变更域标签：`safe-wallet/policy-change/v1`，字段为钱包标识、版本、nonce、截止时间、
@@ -186,12 +230,12 @@ digest = sha256( encStr(domainTag) || 各字段 )
 ```
 src/
   crypto.ts    secp256k1 点运算 / RFC6979 签名 / 公钥恢复 / 地址 / SHA-256
-  encoding.ts  规范化长度前缀编码与各类操作（含批量交易）的签名摘要
+  encoding.ts  规范化长度前缀编码与各类操作（含批量交易、交易审批）的签名摘要
   errors.ts    公开错误类型
   queue.ts     FIFO 执行队列（排序、终态、幂等、digest 防重）
-  wallet.ts    多签钱包引擎（阈值、签名收集、nonce、提交校验、批量、策略应用）
+  wallet.ts    多签钱包引擎（阈值、签名收集、nonce、提交校验、批量、审批分阶段收集、策略应用）
   index.ts     统一导出
-test/          node:test 测试（密码学、编码、队列、提交、执行、批量、取消、对抗输入）
+test/          node:test 测试（密码学、编码、队列、提交、执行、批量、审批、取消、对抗输入）
 ```
 
 ## 最小示例
@@ -257,6 +301,46 @@ const batchTask = wallet.submitBatchTransaction(
 const executed = wallet.executeTask(batchTask.id);
 (executed.receipt!.result as { kind: string }).kind; // 'transfer-batch'
 // result.calls 按输入顺序给出 { to, value, data(hex) }；整批只有这一个回执
+```
+
+### 普通交易分阶段签名收集（审批）
+
+```ts
+import { hashTransactionApproval } from './src/encoding.ts';
+
+// 1) 登记：不消费 nonce、不入队；版本在创建时自动绑定
+const approval = wallet.createTransactionApproval({
+  nonce: wallet.expectedNonce, // 0n，仅预留，此时不消费
+  deadline: 5000n,
+  to: b.address,
+  value: 100n,
+  data: new Uint8Array(),
+});
+approval.status;   // 'collecting'
+
+// 2) 当前所有者逐个加签（签名走 tx-approval/v1 域，绑定创建时版本 approval.version）
+const makeApprovalSig = (k: { privateKey: Uint8Array }) => {
+  const d = hashTransactionApproval({
+    walletId: 'wallet-1',
+    version: approval.version,
+    nonce: approval.nonce,
+    deadline: approval.deadline,
+    to: approval.to,
+    value: approval.value,
+    data: approval.data,
+  });
+  return signDigest(k.privateKey, d);
+};
+wallet.addApprovalSignature(approval.id, makeApprovalSig(a));
+const ready = wallet.addApprovalSignature(approval.id, makeApprovalSig(b));
+ready.status;      // 'ready'（阈值 2）
+ready.signers;     // [a.address, b.address]，按加签顺序
+
+// 3) 阈值满足后提交：按 tx/v1 摘要入队，只消费创建时 nonce
+const task = wallet.submitApprovedTransaction(approval.id);
+wallet.getTransactionApproval(approval.id).status; // 'submitted'
+wallet.expectedNonce; // 1n
+wallet.executeTask(task.id).status; // 'executed'，回执与旧入口普通交易一致
 ```
 
 ## 约定

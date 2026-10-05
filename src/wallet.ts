@@ -1,14 +1,15 @@
 /**
  * 多签钱包策略引擎。
  *
- * 在阈值策略、签名收集、重放防护、FIFO 执行队列、策略变更任务与任务取消之上，新增
- * “原子批量普通交易”：当前所有者以阈值签名（safe-wallet/tx-batch/v1 域，绑定钱包标识、
- * nonce、截止时间与按顺序编码的全部调用）提交一个有序调用列表（1..64 项）。
- * 批量任务只入队一个队列任务、只消费一个 nonce；执行时整批成功产生一个 transfer-batch
- * 回执（不产生部分执行回执），失败则整批不生效。批量任务沿用同一 FIFO 队列、取消语义与
- * 终态幂等；单笔交易 / 策略变更 / 取消签名均不能授权批量交易。
+ * 在阈值策略、签名收集、重放防护、FIFO 执行队列、策略变更任务、任务取消与原子批量之上，
+ * 新增“普通交易分阶段签名收集（审批）”：createTransactionApproval 只登记交易内容与
+ * 创建时策略版本（safe-wallet/tx-approval/v1 域摘要），不消费 nonce、不入队、不建任务；
+ * 所有者可逐个 addApprovalSignature 加签，达到当前阈值后由 submitApprovedTransaction
+ * 按既有 safe-wallet/tx/v1 摘要入队，仅在此时消费创建时预留的 nonce。
+ * 审批摘要与普通交易摘要域分隔、互不通用；旧的一次性提交入口行为保持不变。
  */
 
+import { createHash } from 'node:crypto';
 import {
   type Address,
   ZERO_ADDRESS,
@@ -20,12 +21,21 @@ import {
   hashCancellation,
   hashPolicyChange,
   hashTransaction,
+  hashTransactionApproval,
   hashTransactionBatch,
   type PolicyChangeRequest,
   type TransactionBatchRequest,
   type TransactionRequest,
 } from './encoding.ts';
 import {
+  ApprovalAlreadySubmittedError,
+  ApprovalExpiredError,
+  ApprovalNotFoundError,
+  ApprovalNonceConflictError,
+  ApprovalPolicyConflictError,
+  ApprovalThresholdNotMetError,
+  DuplicateApprovalSignatureError,
+  InvalidApprovalSignatureError,
   InvalidCancellation,
   InvalidPolicyChange,
   InvalidTransaction,
@@ -72,6 +82,33 @@ export interface BatchCall {
 }
 
 export type WalletTask = QueueTask<WalletTaskPayload>;
+
+/**
+ * 审批内部记录（不导出）：登记审批摘要（tx-approval 域）、提交时使用的普通交易摘要
+ * （tx 域）、创建时版本/nonce/阈值快照，以及按加签顺序去重收集的签名者。
+ * 创建不消费 nonce、不入队；submitted 仅在 submitApprovedTransaction 成功入队后置位。
+ */
+interface ApprovalRecord {
+  id: string;
+  /** safe-wallet/tx-approval/v1 摘要 */
+  approvalDigest: Buffer;
+  /** safe-wallet/tx/v1 摘要（hex）；提交入队时作为任务 digest */
+  txDigest: string;
+  version: bigint;
+  nonce: bigint;
+  deadline: bigint;
+  /** 创建时确认数快照 */
+  confirmations: bigint;
+  to: Address;
+  value: bigint;
+  data: Buffer;
+  /** 按加签先后顺序排列的去重签名者（加入时均为当前所有者） */
+  signers: Address[];
+  submitted: boolean;
+  /** 提交入队后的任务 id；仅 submitted 时存在 */
+  taskId?: string;
+  createdAt: bigint;
+}
 
 export interface PolicyState {
   owners: Address[];
@@ -128,6 +165,46 @@ export interface BatchTransactionSubmission {
 /** 批量交易调用数量上限（含） */
 export const MAX_BATCH_CALLS = 64;
 
+// ---------- 普通交易分阶段签名收集（审批） ----------
+
+/** 创建审批的入参：字段与普通交易提交一致（策略版本在创建时自动绑定，不由调用方提供） */
+export type TransactionApprovalSubmission = TransactionSubmission;
+
+/**
+ * 审批生命周期：
+ *   collecting  —— 已登记，去重签名者尚不足当前确认数（可加签）
+ *   ready       —— 去重签名者已达到当前确认数（仍可继续由其他所有者加签，可提交）
+ *   expired     —— 查询时刻已过截止时间（终态：不可加签 / 提交；过期优先于版本漂移）
+ *   conflicted  —— 未过期但当前策略版本已不同于创建时版本（终态：不可加签 / 提交）
+ *   submitted   —— 已由 submitApprovedTransaction 入队（终态：不可加签 / 重复提交）
+ */
+export type TransactionApprovalStatus =
+  | 'collecting'
+  | 'ready'
+  | 'expired'
+  | 'conflicted'
+  | 'submitted';
+
+export interface TransactionApproval {
+  /** 审批标识（引擎内唯一、可复现地由审批摘要派生） */
+  id: string;
+  /** safe-wallet/tx-approval/v1 域的签名摘要（hex） */
+  digest: string;
+  /** 创建时绑定的策略版本 */
+  version: bigint;
+  /** 提交时将消费的 nonce（创建时不消费） */
+  nonce: bigint;
+  deadline: bigint;
+  /** 创建时达到阈值所需的确认数快照（信息性） */
+  confirmations: bigint;
+  to: Address;
+  value: bigint;
+  data: Uint8Array;
+  /** 已加签的当前所有者地址，按加签先后顺序排列（去重） */
+  signers: Address[];
+  status: TransactionApprovalStatus;
+}
+
 function isNonNegativeInteger(n: bigint, maxBits = 256): boolean {
   return n >= 0n && n < 2n ** BigInt(maxBits);
 }
@@ -153,6 +230,9 @@ export class MultiSigWallet {
   private nextNonce = 0n;
   /** 已消费 nonce（入队即消费；失败终态也不释放） */
   private readonly usedNonces = new Set<bigint>();
+
+  /** 已登记的普通交易审批（按 id 索引）；创建不消费 nonce、不入队 */
+  private readonly approvals = new Map<string, ApprovalRecord>();
 
   readonly queue: ExecutionQueue<WalletTaskPayload>;
 
@@ -253,10 +333,207 @@ export class MultiSigWallet {
     );
   }
 
+  // ---------- 普通交易分阶段签名收集（审批） ----------
+
+  /**
+   * 登记一个普通交易审批：校验字段与 nonce 顺序，记录创建时策略版本下的
+   * safe-wallet/tx-approval/v1 摘要；不消费 nonce、不入队、不建任务、不改策略。
+   *
+   * 失败约定（与既有提交一致：不消费 nonce、不建任务、不改策略）：
+   *   - nonce / deadline / 收款地址 / 金额 / data 非法，或 nonce 跳号（≠ expectedNonce）
+   *     → InvalidTransaction
+   *   - nonce 已被使用 → NonceAlreadyUsedError（旧请求重放恒得此异常，即使已过期）
+   *   - deadline 早于当前时间 → RequestExpired
+   */
+  createTransactionApproval(sub: TransactionApprovalSubmission): TransactionApproval {
+    // 校验优先级与 submit('transaction') 保持一致：
+    //   1) nonce 复用 → NonceAlreadyUsedError
+    //   2) 截止时间 → RequestExpired
+    //   3) 字段 / nonce 顺序 → InvalidTransaction
+    const nonce = toBigInt(sub.nonce, InvalidTransaction, 'nonce');
+    if (!isNonNegativeInteger(nonce)) throw new InvalidTransaction('nonce must be a non-negative integer');
+    if (this.usedNonces.has(nonce)) throw new NonceAlreadyUsedError(nonce);
+
+    const deadline = toBigInt(sub.deadline, InvalidTransaction, 'deadline');
+    if (!isNonNegativeInteger(deadline)) throw new InvalidTransaction('deadline out of range');
+    if (deadline < this.now()) {
+      throw new RequestExpired(`request deadline ${deadline} already passed`);
+    }
+    if (nonce !== this.nextNonce) {
+      throw new InvalidTransaction(`expected nonce ${this.nextNonce}, got ${nonce}`);
+    }
+
+    const to = normalizeAddress(sub.to);
+    if (to === null || isZeroAddress(to)) throw new InvalidTransaction('invalid or zero recipient address');
+    const value = toBigInt(sub.value, InvalidTransaction, 'value');
+    if (!isNonNegativeInteger(value)) throw new InvalidTransaction('value out of range');
+    const dataField = sub.data;
+    if (
+      dataField !== undefined &&
+      !(dataField instanceof Uint8Array) &&
+      !ArrayBuffer.isView(dataField)
+    ) {
+      throw new InvalidTransaction('data must be a byte array');
+    }
+    // 复制 data，避免登记后调用方再改动同一缓冲区改变审批内容 / 摘要
+    const data = Buffer.from(dataField ?? new Uint8Array());
+
+    const version = this.version;
+    const approvalDigest = hashTransactionApproval({
+      walletId: this.id,
+      version,
+      nonce,
+      deadline,
+      to,
+      value,
+      data,
+    });
+    // 提交时沿用既有普通交易摘要（不含版本字段）与任务 payload
+    const txDigest = hashTransaction({
+      walletId: this.id,
+      nonce,
+      deadline,
+      to,
+      value,
+      data,
+    });
+
+    const id = createHash('sha256')
+      .update(`approval:${approvalDigest.toString('hex')}`)
+      .digest('hex')
+      .slice(0, 16);
+    // 同一审批摘要重复登记：幂等返回既有审批（内容与版本承诺完全相同，不产生第二条记录）
+    const existing = this.approvals.get(id);
+    if (existing !== undefined) return this.toApprovalView(existing);
+
+    const record: ApprovalRecord = {
+      id,
+      approvalDigest,
+      txDigest: txDigest.toString('hex'),
+      version,
+      nonce,
+      deadline,
+      confirmations: this.confirmations,
+      to,
+      value,
+      data,
+      signers: [],
+      submitted: false,
+      createdAt: this.now(),
+    };
+    this.approvals.set(id, record);
+    return this.toApprovalView(record);
+  }
+
+  /**
+   * 对审批追加一个 65 字节签名（r||s||v）：签名摘要必须是创建时的
+   * safe-wallet/tx-approval/v1 摘要，恢复出的签名者必须是当前所有者。
+   *
+   * 错误约定：
+   *   - 未知 id → ApprovalNotFoundError
+   *   - 已提交 → ApprovalAlreadySubmittedError
+   *   - 已过截止时间 → ApprovalExpiredError（过期优先于版本冲突）
+   *   - 版本漂移（未过期）→ ApprovalPolicyConflictError
+   *   - 同一当前所有者再次加签 → DuplicateApprovalSignatureError
+   *   - 签名格式 / 摘要 / 签名者不符（非 65 字节、恢复失败、签名者非当前所有者）
+   *     → InvalidApprovalSignatureError
+   *
+   * 去重后的当前所有者签名数达到当前确认数时状态转为 ready；返回更新后的审批视图。
+   */
+  addApprovalSignature(approvalId: string, signature: Uint8Array): TransactionApproval {
+    const record = this.requireActiveApproval(approvalId);
+
+    if (!(signature instanceof Uint8Array) || signature.length !== 65) {
+      throw new InvalidApprovalSignatureError('each signature must be a 65-byte r||s||v blob');
+    }
+    const signer = recoverAddress(record.approvalDigest, Uint8Array.from(signature));
+    if (signer === null) {
+      throw new InvalidApprovalSignatureError('malformed or non-canonical signature');
+    }
+    if (!this.ownerSet.has(signer)) {
+      // 非当前所有者：既可能是伪造，也可能是签名载荷与审批内容不匹配
+      throw new InvalidApprovalSignatureError(
+        'signature does not match approval payload or signer is not a current owner',
+      );
+    }
+    if (record.signers.includes(signer)) {
+      throw new DuplicateApprovalSignatureError(`owner ${signer} already signed approval`);
+    }
+    record.signers.push(signer);
+    return this.toApprovalView(record);
+  }
+
+  /**
+   * 查询审批当前状态与有序签名者。未知 id → ApprovalNotFoundError。
+   * 状态按查询时刻计算：过期优先（expired），其次版本漂移（conflicted），
+   * 已提交（submitted），否则按签名数相对当前确认数给出 collecting / ready。
+   */
+  getTransactionApproval(approvalId: string): TransactionApproval {
+    const record = this.approvals.get(approvalId);
+    if (record === undefined) throw new ApprovalNotFoundError(`approval not found: ${approvalId}`);
+    return this.toApprovalView(record);
+  }
+
+  /**
+   * 在阈值满足后提交审批：按既有 safe-wallet/tx/v1 摘要入队一个普通交易任务，
+   * 队列与终态行为与 submitTransaction 完全一致；只消费创建时预留的 nonce。
+   *
+   * 错误约定：
+   *   - 未知 id → ApprovalNotFoundError
+   *   - 已提交 → ApprovalAlreadySubmittedError
+   *   - 已过截止时间 → ApprovalExpiredError（过期优先于版本冲突）
+   *   - 版本漂移（未过期）→ ApprovalPolicyConflictError
+   *   - 去重签名者不足当前确认数 → ApprovalThresholdNotMetError
+   *   - 创建时 nonce 已被其他入口使用 → NonceAlreadyUsedError
+   *   - 创建时 nonce 已不等于 expectedNonce（被其他 nonce 插队）→ ApprovalNonceConflictError
+   *
+   * 任一失败都不入队、不消费 nonce、不改策略。
+   */
+  submitApprovedTransaction(approvalId: string): WalletTask {
+    const record = this.requireActiveApproval(approvalId);
+
+    if (BigInt(record.signers.length) < this.confirmations) {
+      throw new ApprovalThresholdNotMetError(
+        `threshold not met: need ${this.confirmations} distinct current owners, got ${record.signers.length}`,
+      );
+    }
+    // 重放防护优先于顺序判定（与既有提交一致）：nonce 已消费恒报 NonceAlreadyUsedError
+    if (this.usedNonces.has(record.nonce)) throw new NonceAlreadyUsedError(record.nonce);
+    if (record.nonce !== this.nextNonce) {
+      throw new ApprovalNonceConflictError(record.nonce, this.nextNonce);
+    }
+
+    const payload: WalletTaskPayload = {
+      kind: 'transaction',
+      deadline: record.deadline,
+      to: record.to,
+      value: record.value,
+      data: Buffer.from(record.data),
+    };
+
+    let task: WalletTask;
+    try {
+      task = this.queue.enqueue({
+        nonce: record.nonce,
+        digest: record.txDigest,
+        payload,
+        submittedAt: this.now(),
+      });
+    } catch (err) {
+      // 与既有 submit 相同的队列防重归一：同一摘要任务已存在时表现为 nonce 复用
+      if (err instanceof InvalidQueueStateError) throw new NonceAlreadyUsedError(record.nonce);
+      throw err;
+    }
+    this.usedNonces.add(record.nonce);
+    this.nextNonce = record.nonce + 1n;
+    record.submitted = true;
+    record.taskId = task.id;
+    return task;
+  }
+
   // ---------- 策略变更提交 ----------
 
-  proposePolicyChange(sub: PolicyChangeSubmission, signatures: readonly Uint8Array[]): WalletTask {
-    return this.submit(
+  proposePolicyChange(sub: PolicyChangeSubmission, signatures: readonly Uint8Array[]): WalletTask {    return this.submit(
       'policy-change',
       {
         version: sub.version,
@@ -526,6 +803,57 @@ export class MultiSigWallet {
       calls.push({ to, value, data: Buffer.from(call.data) });
     }
     return calls;
+  }
+
+  /**
+   * 取出“仍可加签 / 提交”的审批，并套用生命周期前置判定。
+   * 顺序：存在 → 已提交 → 过期（优先）→ 版本漂移。
+   */
+  private requireActiveApproval(approvalId: string): ApprovalRecord {
+    const record = this.approvals.get(approvalId);
+    if (record === undefined) throw new ApprovalNotFoundError(`approval not found: ${approvalId}`);
+    if (record.submitted) {
+      throw new ApprovalAlreadySubmittedError(`approval ${approvalId} already submitted`);
+    }
+    if (record.deadline < this.now()) {
+      throw new ApprovalExpiredError(`approval deadline ${record.deadline} already passed`);
+    }
+    if (record.version !== this.version) {
+      throw new ApprovalPolicyConflictError(
+        `policy version drifted: approval bound ${record.version}, current ${this.version}`,
+      );
+    }
+    return record;
+  }
+
+  /**
+   * 生成审批的只读视图：状态按查询时刻的时钟、策略版本与签名数计算。
+   * 过期优先于版本漂移；已提交的审批保持 submitted（即使后来过期或版本变化）。
+   */
+  private toApprovalView(record: ApprovalRecord): TransactionApproval {
+    let status: TransactionApprovalStatus;
+    if (record.submitted) {
+      status = 'submitted';
+    } else if (record.deadline < this.now()) {
+      status = 'expired';
+    } else if (record.version !== this.version) {
+      status = 'conflicted';
+    } else {
+      status = BigInt(record.signers.length) >= this.confirmations ? 'ready' : 'collecting';
+    }
+    return {
+      id: record.id,
+      digest: record.approvalDigest.toString('hex'),
+      version: record.version,
+      nonce: record.nonce,
+      deadline: record.deadline,
+      confirmations: record.confirmations,
+      to: record.to,
+      value: record.value,
+      data: Buffer.from(record.data),
+      signers: [...record.signers],
+      status,
+    };
   }
 
   /** 按“当前策略”的所有者集合与确认数校验签名收集 */
