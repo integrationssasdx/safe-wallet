@@ -1,5 +1,6 @@
 import { generateKeyPair, signDigest, sha256, type Address, type KeyPair } from '../src/crypto.ts';
 import {
+  hashApprovalRevocation,
   hashBatchApproval,
   hashCancellation,
   hashPolicyChange,
@@ -212,6 +213,26 @@ export function signBatchApproval(
   });
   const finalParams = opts.mutate ? opts.mutate(p) : p;
   const digest = hashBatchApproval(normalize(finalParams));
+  return signers.map((s) => signDigest(s.privateKey, digest));
+}
+
+// ---------- 统一审批撤销 ----------
+
+export interface RevokeParams {
+  walletId: string;
+  /** 目标审批摘要（hex） */
+  approvalDigest: string;
+  nonce: bigint;
+  deadline: bigint;
+}
+
+export function signApprovalRevocation(
+  signers: Actor[],
+  p: RevokeParams,
+  opts: { mutate?: (base: RevokeParams) => RevokeParams } = {},
+): Buffer[] {
+  const finalParams = opts.mutate ? opts.mutate(p) : p;
+  const digest = hashApprovalRevocation(finalParams);
   return signers.map((s) => signDigest(s.privateKey, digest));
 }
 

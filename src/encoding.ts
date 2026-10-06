@@ -9,6 +9,7 @@
  *   - 普通交易分阶段审批："safe-wallet/tx-approval/v1"
  *   - 策略变更分阶段审批："safe-wallet/policy-change-approval/v1"
  *   - 批量交易分阶段审批："safe-wallet/tx-batch-approval/v1"
+ *   - 统一审批撤销：      "safe-wallet/approval-revoke/v1"
  *
  * 编码规则（全部大端）：
  *   encBytes(b)  = uint32(len) || b
@@ -31,6 +32,7 @@ const TAG_CANCEL = 'safe-wallet/cancel/v1';
 const TAG_TX_APPROVAL = 'safe-wallet/tx-approval/v1';
 const TAG_POLICY_APPROVAL = 'safe-wallet/policy-change-approval/v1';
 const TAG_BATCH_APPROVAL = 'safe-wallet/tx-batch-approval/v1';
+const TAG_APPROVAL_REVOKE = 'safe-wallet/approval-revoke/v1';
 
 // ---------- 编码原语 ----------
 
@@ -146,6 +148,14 @@ export interface TransactionBatchApprovalRequest {
   deadline: bigint;
   /** 有序调用列表（1..64 项）；顺序参与签名，不得改变 */
   calls: BatchTransactionCall[];
+}
+
+export interface ApprovalRevocationRequest {
+  walletId: string;
+  /** 目标审批的签名摘要（hex，三类审批快照中的 digest）：把撤销请求绑定到唯一审批 */
+  approvalDigest: string;
+  nonce: bigint;
+  deadline: bigint;
 }
 
 function walletIdBytes(walletId: string): Buffer {
@@ -320,5 +330,25 @@ export function hashBatchApproval(req: {
     encUint(req.nonce),
     encUint(deadlineToBigint(req.deadline)),
     encList(encodedCalls),
+  ]);
+}
+
+/**
+ * 统一审批撤销的签名摘要：绑定钱包标识、目标审批摘要（approvalDigest，hex）、nonce 与
+ * 截止时间。使用独立的 safe-wallet/approval-revoke/v1 域：与三类审批的创建/加签域、
+ * 直接提交域、取消域两两互不通用；审批摘要把撤销绑定到唯一审批（跨审批签名无效），
+ * 钱包标识防止跨钱包重放，nonce/deadline 与既有重放防护和时效窗口口径一致。
+ */
+export function hashApprovalRevocation(req: {
+  walletId: string;
+  approvalDigest: string;
+  nonce: bigint | number;
+  deadline: bigint | number;
+}): Buffer {
+  return digest(TAG_APPROVAL_REVOKE, [
+    encBytes(walletIdBytes(req.walletId)),
+    encBytes(hexToBytes(req.approvalDigest)),
+    encUint(req.nonce),
+    encUint(deadlineToBigint(req.deadline)),
   ]);
 }

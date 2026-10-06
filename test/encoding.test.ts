@@ -5,6 +5,8 @@ import {
   encList,
   encStr,
   encUint,
+  hashApprovalRevocation,
+  hashCancellation,
   hashPolicyChange,
   hashTransaction,
 } from '../src/encoding.ts';
@@ -141,4 +143,37 @@ test('两类操作域分隔：即使字段相同，交易摘要与策略变更�
     newConfirmations: 1n,
   });
   assert.ok(!tx.equals(pc));
+});
+
+const baseRevoke = () => ({
+  walletId: 'wallet-A',
+  approvalDigest: '0x' + 'ab'.repeat(32),
+  nonce: 7n,
+  deadline: 9999n,
+});
+
+test('审批撤销摘要：确定性 32 字节，对任一绑定字段敏感', () => {
+  const h1 = hashApprovalRevocation(baseRevoke());
+  const h2 = hashApprovalRevocation(baseRevoke());
+  assert.equal(h1.length, 32);
+  assert.ok(h1.equals(h2));
+  for (const v of [
+    { ...baseRevoke(), walletId: 'wallet-B' },
+    { ...baseRevoke(), approvalDigest: '0x' + 'cd'.repeat(32) },
+    { ...baseRevoke(), nonce: 8n },
+    { ...baseRevoke(), deadline: 9998n },
+  ]) {
+    assert.ok(!hashApprovalRevocation(v).equals(h1));
+  }
+});
+
+test('审批撤销域独立：与取消摘要即使编码字段数值相同也不相等', () => {
+  const r = hashApprovalRevocation(baseRevoke());
+  const c = hashCancellation({
+    walletId: 'wallet-A',
+    taskDigest: '0x' + 'ab'.repeat(32),
+    nonce: 7n,
+    deadline: 9999n,
+  });
+  assert.ok(!r.equals(c));
 });

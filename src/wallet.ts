@@ -27,6 +27,12 @@
  * deadline 与按顺序编码的全部调用），达到创建时确认数后由 submitBatchApproval 按既有
  * safe-wallet/tx-batch/v1 摘要入队一个 transaction-batch 任务并只消费创建时 nonce。
  * 审批签名与批量直接提交签名互不通用；执行保持原子回执、FIFO、取消与终态幂等。
+ *
+ * 最后新增“统一审批撤销”：revokeApproval 以阈值签名（safe-wallet/approval-revoke/v1 域，
+ * 绑定钱包标识、目标审批摘要、nonce、deadline）撤销三类审批中尚未提交的任一个（含已过期、
+ * 已版本漂移的审批）。成功只消费一次 nonce、返回 revoked 快照：不建任务、不产回执，不改
+ * owners/confirmations/policyVersion 与既有任务；审批已收集签名者保留但全部失效。
+ * 已提交审批不适用撤销（对应任务的取消走既有 cancelTask）；撤销/提交/取消等签名域两两独立。
  */
 
 import {
@@ -34,6 +40,7 @@ import {
   ZERO_ADDRESS,
   isZeroAddress,
   normalizeAddress,
+  parseSignature,
   recoverAddress,
 } from './crypto.ts';
 import {
@@ -44,6 +51,8 @@ import {
   hashTransaction,
   hashTransactionApproval,
   hashTransactionBatch,
+  hashApprovalRevocation,
+  type ApprovalRevocationRequest,
   type PolicyApprovalRequest,
   type PolicyChangeRequest,
   type TransactionApprovalRequest,
@@ -57,8 +66,13 @@ import {
   ApprovalNonceConflictError,
   ApprovalNotFoundError,
   ApprovalPolicyConflictError,
+  ApprovalRevocationConflictError,
+  ApprovalRevocationThresholdNotMetError,
   ApprovalThresholdNotMetError,
   DuplicateApprovalSignatureError,
+  InvalidApprovalRevocationNonceError,
+  InvalidApprovalRevocationRequest,
+  InvalidApprovalRevocationSigner,
   InvalidApprovalSignatureError,
   InvalidCancellation,
   InvalidPolicyChange,
@@ -160,13 +174,29 @@ export interface BatchTransactionSubmission {
   calls: readonly BatchCallSubmission[];
 }
 
+/** 统一审批撤销请求：approvalId 指向三类审批中的任一个；nonce 为本次撤销自身的 nonce */
+export interface ApprovalRevocationSubmission {
+  approvalId: string;
+  nonce: bigint | number;
+  deadline: bigint | number;
+}
+
 /** 批量交易调用数量上限（含） */
 export const MAX_BATCH_CALLS = 64;
 
 // ---------- 普通交易分阶段审批 ----------
 
-/** 审批生命周期：collecting → ready → submitted；expired / conflicted 为查询派生状态 */
-export type ApprovalStatus = 'collecting' | 'ready' | 'expired' | 'conflicted' | 'submitted';
+/**
+ * 审批生命周期：collecting → ready → submitted；expired / conflicted 为查询派生状态；
+ * revoked 为撤销终态（由 revokeApproval 写入，优先级最高，快照保留已收集签名者但全部失效）
+ */
+export type ApprovalStatus =
+  | 'collecting'
+  | 'ready'
+  | 'expired'
+  | 'conflicted'
+  | 'submitted'
+  | 'revoked';
 
 /** 审批的公开快照（创建 / 加签 / 查询时返回） */
 export interface TransactionApproval {
@@ -198,6 +228,21 @@ interface ApprovalRecord {
   signers: Address[];
   signatures: Map<Address, Buffer>;
   submitted: boolean;
+  revoked: boolean;
+  /** 仅 revoked 时存在：撤销时间、撤销摘要与撤销阈值签名者（原审批签名保留但失效） */
+  revocation?: RevocationRecord;
+}
+
+/** 统一撤销终态记录（三类审批共用） */
+interface RevocationRecord {
+  revokedAt: bigint;
+  /** 撤销请求的签名摘要（safe-wallet/approval-revoke/v1 域） */
+  digest: Buffer;
+  /** 撤销请求收集到的去重当前所有者签名者 */
+  signers: Address[];
+  /** 撤销自身消费的 nonce */
+  nonce: bigint;
+  deadline: bigint;
 }
 
 // ---------- 策略变更分阶段审批 ----------
@@ -237,6 +282,8 @@ interface PolicyApprovalRecord {
   signers: Address[];
   signatures: Map<Address, Buffer>;
   submitted: boolean;
+  revoked: boolean;
+  revocation?: RevocationRecord;
 }
 
 // ---------- 批量交易分阶段审批 ----------
@@ -275,6 +322,8 @@ interface BatchApprovalRecord {
   signers: Address[];
   signatures: Map<Address, Buffer>;
   submitted: boolean;
+  revoked: boolean;
+  revocation?: RevocationRecord;
 }
 
 function isNonNegativeInteger(n: bigint, maxBits = 256): boolean {
@@ -590,6 +639,7 @@ export class MultiSigWallet {
       signers: [],
       signatures: new Map(),
       submitted: false,
+      revoked: false,
     };
     this.approvals.set(id, record);
     return this.approvalSnapshot(record);
@@ -763,6 +813,7 @@ export class MultiSigWallet {
       signers: [],
       signatures: new Map(),
       submitted: false,
+      revoked: false,
     };
     this.policyApprovals.set(id, record);
     return this.policyApprovalSnapshot(record);
@@ -941,6 +992,7 @@ export class MultiSigWallet {
       signers: [],
       signatures: new Map(),
       submitted: false,
+      revoked: false,
     };
     this.batchApprovals.set(id, record);
     return this.batchApprovalSnapshot(record);
@@ -1047,6 +1099,163 @@ export class MultiSigWallet {
     this.nextNonce = record.nonce + 1n;
     record.submitted = true;
     return task;
+  }
+
+  // ---------- 统一审批撤销（覆盖三类审批的未提交审批；提交 / 执行 / 取消行为不变） ----------
+
+  /**
+   * 撤销一个尚未提交的审批（普通交易 / 策略变更 / 批量交易审批同一入口）。
+   *
+   * 撤销摘要用独立的 safe-wallet/approval-revoke/v1 域，绑定钱包标识、目标审批摘要
+   * （approvalDigest）、本次撤销自身的 nonce 与 deadline：跨钱包、跨审批及其他操作
+   * （审批创建/加签、直接提交、取消）的签名一律无效。撤销只需要“当前所有者 + 当前确认数”
+   * 的全新阈值签名，与审批此前收集了多少签名无关；原审批已收集签名者在快照中保留但全部失效。
+   *
+   * 校验顺序（与约定严格一致；任一失败都不消费 nonce、不改审批/策略/队列）：
+   *   1) 字段非法（approvalId 非字符串、nonce/deadline 非合法非负整数）或签名集合畸形
+   *      （非数组 / 空 / 元素非 65 字节 / 签名无法解析恢复）→ InvalidApprovalRevocationRequest
+   *   2) nonce 复用 → NonceAlreadyUsedError（旧撤销重放恒得此异常，即使已过期）
+   *   3) deadline 早于当前时间 → RequestExpired
+   *   4) nonce ≠ expectedNonce → InvalidApprovalRevocationNonceError
+   *   5) 审批不存在 → ApprovalNotFoundError
+   *   6) 审批已撤销或已提交 → ApprovalRevocationConflictError
+   *      （revoked 优先；expired / conflicted 仍可撤销，不在此拦截）
+   *   7) 签名与摘要不匹配 / 签名者非当前所有者 → InvalidApprovalRevocationSigner；
+   *      去重签名者不足当前确认数 → ApprovalRevocationThresholdNotMetError
+   *
+   * 成功只消费一次本次撤销 nonce 并推进 expectedNonce，返回目标审批的 revoked 快照：
+   * 不建任务、不产执行回执，不改 owners / confirmations / policyVersion 与既有任务。
+   * 撤销后再加签、再撤销或提交都抛 ApprovalRevocationConflictError。
+   */
+  revokeApproval(
+    sub: ApprovalRevocationSubmission,
+    signatures: readonly Uint8Array[],
+  ): TransactionApproval | PolicyApproval | BatchApproval;
+  revokeApproval(
+    approvalId: string,
+    nonce: bigint | number,
+    deadline: bigint | number,
+    signatures: readonly Uint8Array[],
+  ): TransactionApproval | PolicyApproval | BatchApproval;
+  revokeApproval(
+    a: ApprovalRevocationSubmission | string,
+    b: readonly Uint8Array[] | bigint | number,
+    c?: bigint | number,
+    d?: readonly Uint8Array[],
+  ): TransactionApproval | PolicyApproval | BatchApproval {
+    const sub: ApprovalRevocationSubmission =
+      typeof a === 'string' || a === undefined || a === null
+        ? { approvalId: a as string, nonce: b as bigint | number, deadline: c as bigint | number }
+        : a;
+    const signatures: readonly Uint8Array[] =
+      (typeof a === 'string' || a === undefined || a === null
+        ? d
+        : (b as readonly Uint8Array[])) ?? ([] as readonly Uint8Array[]);
+
+    // (1) 字段层：approvalId 必须是非空字符串；签名集合必须先通过形状与可解析性检查
+    //     （畸形请求不允许落到 nonce / 审批查询阶段）
+    if (typeof sub.approvalId !== 'string' || sub.approvalId.length === 0) {
+      throw new InvalidApprovalRevocationRequest('approvalId must be a non-empty string');
+    }
+    if (!Array.isArray(signatures)) {
+      throw new InvalidApprovalRevocationRequest('signatures must be an array');
+    }
+    if (signatures.length === 0) {
+      throw new InvalidApprovalRevocationRequest('missing signatures');
+    }
+    const blobs: Uint8Array[] = [];
+    for (const sig of signatures) {
+      if (!(sig instanceof Uint8Array) || sig.length !== 65) {
+        throw new InvalidApprovalRevocationRequest(
+          'each signature must be a 65-byte r||s||v blob',
+        );
+      }
+      // 先做可解析性检查：无法恢复（含 high-s / 畸形曲线点）属于请求格式问题
+      if (parseSignature(sig) === null) {
+        throw new InvalidApprovalRevocationRequest('malformed or non-canonical signature');
+      }
+      blobs.push(Uint8Array.from(sig));
+    }
+
+    const nonce = toBigInt(sub.nonce, InvalidApprovalRevocationRequest, 'nonce');
+    if (!isNonNegativeInteger(nonce)) {
+      throw new InvalidApprovalRevocationRequest('nonce must be a non-negative integer');
+    }
+    // (2) nonce 复用优先于过期判定（与提交 / 取消同一口径）
+    if (this.usedNonces.has(nonce)) throw new NonceAlreadyUsedError(nonce);
+
+    const deadline = toBigInt(sub.deadline, InvalidApprovalRevocationRequest, 'deadline');
+    if (!isNonNegativeInteger(deadline)) {
+      throw new InvalidApprovalRevocationRequest('deadline out of range');
+    }
+    // (3) 截止时间
+    if (deadline < this.now()) {
+      throw new RequestExpired(`request deadline ${deadline} already passed`);
+    }
+    // (4) nonce 顺序：撤销与提交 / 取消共用同一严格递增序列
+    if (nonce !== this.nextNonce) {
+      throw new InvalidApprovalRevocationNonceError(
+        `expected nonce ${this.nextNonce}, got ${nonce}`,
+      );
+    }
+
+    // (5) 审批存在性：三类审批命名空间统一按 id 查找
+    const located = this.locateApproval(sub.approvalId);
+    if (located === null) {
+      throw new ApprovalNotFoundError(`approval not found: ${sub.approvalId}`);
+    }
+
+    // (6) 审批状态：已撤销 / 已提交即冲突（revoked 优先）；expired / conflicted 仍可撤销
+    if (located.record.revoked) {
+      throw new ApprovalRevocationConflictError(
+        `approval ${located.record.id} already revoked`,
+      );
+    }
+    if (located.record.submitted) {
+      throw new ApprovalRevocationConflictError(
+        `approval ${located.record.id} already submitted`,
+      );
+    }
+
+    // (7) 阈值签名：摘要绑定钱包标识、目标审批摘要、nonce、deadline
+    const req: ApprovalRevocationRequest = {
+      walletId: this.id,
+      approvalDigest: located.record.digest.toString('hex'),
+      nonce,
+      deadline,
+    };
+    const digest = hashApprovalRevocation(req);
+    const signerSet = new Set<Address>();
+    for (const blob of blobs) {
+      // 形状与可解析性已在字段层校验；此处恢复签名者：对不上当前所有者即签名无效
+      const signer = recoverAddress(digest, blob);
+      if (signer === null || !this.ownerSet.has(signer)) {
+        throw new InvalidApprovalRevocationSigner(
+          'signature does not match revocation or signer is not a current owner',
+        );
+      }
+      signerSet.add(signer); // 地址去重：同一所有者多签只计一次
+    }
+    if (BigInt(signerSet.size) < this.confirmations) {
+      throw new ApprovalRevocationThresholdNotMetError(
+        `threshold not met: need ${this.confirmations} distinct current owners, got ${signerSet.size}`,
+      );
+    }
+
+    // 原子生效：审批进入 revoked 终态 + 只消费本次撤销 nonce；
+    // 不建任务、不产回执，策略与既有任务不变，原审批签名保留但失效
+    const revocation: RevocationRecord = {
+      revokedAt: this.now(),
+      digest,
+      signers: [...signerSet],
+      nonce,
+      deadline,
+    };
+    located.record.revoked = true;
+    located.record.revocation = revocation;
+    this.usedNonces.add(nonce);
+    this.nextNonce = nonce + 1n;
+    return this.approvalSnapshotOf(located);
   }
 
   // ---------- 执行 ----------
@@ -1238,14 +1447,50 @@ export class MultiSigWallet {
 
   // ---------- 分阶段审批内部辅助 ----------
 
+  /** 三类审批统一定位结果（撤销入口跨命名空间按 id 查找） */
+  private locateApproval(
+    approvalId: string,
+  ):
+    | { kind: 'transaction'; record: ApprovalRecord }
+    | { kind: 'policy'; record: PolicyApprovalRecord }
+    | { kind: 'batch'; record: BatchApprovalRecord }
+    | null {
+    const tx = this.approvals.get(approvalId);
+    if (tx !== undefined) return { kind: 'transaction', record: tx };
+    const policy = this.policyApprovals.get(approvalId);
+    if (policy !== undefined) return { kind: 'policy', record: policy };
+    const batch = this.batchApprovals.get(approvalId);
+    if (batch !== undefined) return { kind: 'batch', record: batch };
+    return null;
+  }
+
+  /** 按定位结果返回对应命名空间的公开快照 */
+  private approvalSnapshotOf(
+    located:
+      | { kind: 'transaction'; record: ApprovalRecord }
+      | { kind: 'policy'; record: PolicyApprovalRecord }
+      | { kind: 'batch'; record: BatchApprovalRecord },
+  ): TransactionApproval | PolicyApproval | BatchApproval {
+    if (located.kind === 'transaction') return this.approvalSnapshot(located.record);
+    if (located.kind === 'policy') return this.policyApprovalSnapshot(located.record);
+    return this.batchApprovalSnapshot(located.record);
+  }
+
   private getApprovalRecord(approvalId: string): ApprovalRecord {
     const record = typeof approvalId === 'string' ? this.approvals.get(approvalId) : undefined;
     if (record === undefined) throw new ApprovalNotFoundError(`approval not found: ${String(approvalId)}`);
     return record;
   }
 
-  /** 已提交 / 已过期 / 版本漂移的审批不可再加签或提交（过期优先于版本冲突） */
+  /**
+   * 已撤销 / 已提交 / 已过期 / 版本漂移的审批不可再加签或提交。
+   * revoked 优先级最高（撤销后加签 / 提交统一抛 ApprovalRevocationConflictError），
+   * 其次 submitted（ApprovalAlreadySubmittedError），过期优先于版本冲突。
+   */
   private assertApprovalActive(record: ApprovalRecord): void {
+    if (record.revoked) {
+      throw new ApprovalRevocationConflictError(`approval ${record.id} already revoked`);
+    }
     if (record.submitted) throw new ApprovalAlreadySubmittedError(`approval ${record.id} already submitted`);
     if (record.deadline < this.now()) {
       throw new ApprovalExpiredError(`approval deadline ${record.deadline} already passed`);
@@ -1257,8 +1502,9 @@ export class MultiSigWallet {
     }
   }
 
-  /** 派生状态：submitted > expired > conflicted > ready > collecting */
+  /** 派生状态：revoked > submitted > expired > conflicted > ready > collecting */
   private approvalStatus(record: ApprovalRecord): ApprovalStatus {
+    if (record.revoked) return 'revoked';
     if (record.submitted) return 'submitted';
     if (record.deadline < this.now()) return 'expired';
     if (record.version !== this.version) return 'conflicted';
@@ -1287,8 +1533,11 @@ export class MultiSigWallet {
     return record;
   }
 
-  /** 已提交 / 已过期 / 版本漂移的策略审批不可再加签或提交（过期优先于版本冲突） */
+  /** 已撤销 / 已提交 / 已过期 / 版本漂移的策略审批不可再加签或提交（revoked 优先，过期优先于版本冲突） */
   private assertPolicyApprovalActive(record: PolicyApprovalRecord): void {
+    if (record.revoked) {
+      throw new ApprovalRevocationConflictError(`policy approval ${record.id} already revoked`);
+    }
     if (record.submitted) {
       throw new ApprovalAlreadySubmittedError(`policy approval ${record.id} already submitted`);
     }
@@ -1302,8 +1551,9 @@ export class MultiSigWallet {
     }
   }
 
-  /** 派生状态：submitted > expired > conflicted > ready > collecting（与普通交易审批同一序） */
+  /** 派生状态：revoked > submitted > expired > conflicted > ready > collecting（与普通交易审批同一序） */
   private policyApprovalStatus(record: PolicyApprovalRecord): ApprovalStatus {
+    if (record.revoked) return 'revoked';
     if (record.submitted) return 'submitted';
     if (record.deadline < this.now()) return 'expired';
     if (record.version !== this.version) return 'conflicted';
@@ -1336,8 +1586,11 @@ export class MultiSigWallet {
     return record;
   }
 
-  /** 已提交 / 已过期 / 版本漂移的批量审批不可再加签或提交（过期优先于版本冲突） */
+  /** 已撤销 / 已提交 / 已过期 / 版本漂移的批量审批不可再加签或提交（revoked 优先，过期优先于版本冲突） */
   private assertBatchApprovalActive(record: BatchApprovalRecord): void {
+    if (record.revoked) {
+      throw new ApprovalRevocationConflictError(`batch approval ${record.id} already revoked`);
+    }
     if (record.submitted) {
       throw new ApprovalAlreadySubmittedError(`batch approval ${record.id} already submitted`);
     }
@@ -1351,8 +1604,9 @@ export class MultiSigWallet {
     }
   }
 
-  /** 派生状态：submitted > expired > conflicted > ready > collecting（与其他审批同一序） */
+  /** 派生状态：revoked > submitted > expired > conflicted > ready > collecting（与其他审批同一序） */
   private batchApprovalStatus(record: BatchApprovalRecord): ApprovalStatus {
+    if (record.revoked) return 'revoked';
     if (record.submitted) return 'submitted';
     if (record.deadline < this.now()) return 'expired';
     if (record.version !== this.version) return 'conflicted';

@@ -79,3 +79,31 @@ export class ApprovalThresholdNotMetError extends WalletError {}
 
 /** 提交时审批绑定的 nonce 不等于当前 expectedNonce（尚未被消费但顺序不符） */
 export class ApprovalNonceConflictError extends WalletError {}
+
+// ---------- 统一审批撤销（普通交易 / 策略变更 / 批量交易审批共用） ----------
+
+/**
+ * 撤销请求本身不合法：approvalId 非字符串、nonce/deadline 无法安全转换或越界、
+ * 签名集合畸形（非数组、空、元素非 65 字节、签名无法恢复）。
+ * 校验顺序中最先发生（字段层），失败不消费 nonce、不改变任何状态。
+ */
+export class InvalidApprovalRevocationRequest extends WalletError {}
+
+/**
+ * 撤销签名无效：签名与 safe-wallet/approval-revoke/v1 摘要不匹配（恢复出的签名者
+ * 对不上任何当前所有者），或签名者不是当前所有者。跨钱包 / 跨审批 / 其他操作域的
+ * 签名在此一并拒绝。
+ */
+export class InvalidApprovalRevocationSigner extends WalletError {}
+
+/** 撤销请求收集到的去重当前所有者签名数不足当前确认数 */
+export class ApprovalRevocationThresholdNotMetError extends WalletError {}
+
+/** 撤销请求 nonce 未耗用但不等于当前 expectedNonce（顺序错；nonce 复用仍抛 NonceAlreadyUsedError） */
+export class InvalidApprovalRevocationNonceError extends WalletError {}
+
+/**
+ * 目标审批与撤销操作冲突：审批已撤销（重复撤销 / 再加签 / 再提交）或已提交
+ * （对应任务已建立，撤销不适用；其未消费 nonce 的取消走既有 cancelTask）。
+ */
+export class ApprovalRevocationConflictError extends WalletError {}
