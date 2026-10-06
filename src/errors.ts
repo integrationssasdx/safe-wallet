@@ -107,3 +107,15 @@ export class InvalidApprovalRevocationNonceError extends WalletError {}
  * （对应任务已建立，撤销不适用；其未消费 nonce 的取消走既有 cancelTask）。
  */
 export class ApprovalRevocationConflictError extends WalletError {}
+
+// ---------- 静态分级支出阈值 ----------
+
+/**
+ * 分级支出阈值策略不合法（构造钱包时抛出，不创建实例）：
+ * minimumValue 非正、达到或超过 2^256、未严格递增；confirmations 非安全正整数、
+ * 低于全局确认数、高于所有者数量或随金额下降。
+ */
+export class InvalidSpendingPolicy extends WalletError {}
+
+/** 支出阈值查询金额不合法：负数或达到 / 超过 2^256（不消费 nonce、不建任务、不改状态） */
+export class InvalidSpendingValueError extends WalletError {}

@@ -33,6 +33,15 @@
  * 已版本漂移的审批）。成功只消费一次 nonce、返回 revoked 快照：不建任务、不产回执，不改
  * owners/confirmations/policyVersion 与既有任务；审批已收集签名者保留但全部失效。
  * 已提交审批不适用撤销（对应任务的取消走既有 cancelTask）；撤销/提交/取消等签名域两两独立。
+ *
+ * 最后新增“静态分级支出阈值”：WalletOptions 可携带 valueThresholds（每项含 minimumValue 与
+ * confirmations，按金额严格递增、确认数随金额不下降，构造时校验，任一违例抛 InvalidSpendingPolicy
+ * 且不创建实例；缺省行为与既有完全一致）。requiredConfirmationsForValue(value) 取不超过 value 的
+ * 最高档（未命中返回全局确认数），requiredConfirmationsForBatch(calls) 按调用 value 总额取档；
+ * 两者均为纯查询。单笔按金额、批量按总额确定有效阈值，直接提交、三类分阶段审批（创建时绑定
+ * 有效阈值）与入队使用同一结果；策略变更及其审批、取消、撤销使用最大档确认数（新所有者数低于
+ * 该值抛 InvalidPolicyChange）；单笔 / 批量任务的取消与审批撤销使用对应有效阈值。阈值只影响
+ * 签名数量要求：签名载荷、摘要、任务 id、回执、FIFO、取消、失败与幂等语义均不变。
  */
 
 import {
@@ -76,6 +85,8 @@ import {
   InvalidApprovalSignatureError,
   InvalidCancellation,
   InvalidPolicyChange,
+  InvalidSpendingPolicy,
+  InvalidSpendingValueError,
   InvalidTransaction,
   InvalidTransactionBatch,
   NonceAlreadyUsedError,
@@ -132,8 +143,24 @@ export interface WalletOptions {
   id: string;
   owners: Address[];
   confirmations: bigint | number;
+  /**
+   * 可选的静态分级支出阈值（按 minimumValue 升序给出）：交易金额达到某一档
+   * minimumValue 时，该档及其以下各档中最高档的 confirmations 即为所需确认数。
+   * 缺省或为空数组时行为与既有完全一致（一律使用全局 confirmations）。
+   */
+  valueThresholds?: readonly ValueThreshold[];
   /** 注入时钟，返回 Unix 秒；默认取系统时间 */
   now?: () => bigint;
+}
+
+/**
+ * 静态分级支出阈值的一档：金额达到 minimumValue 时至少需要 confirmations 个确认。
+ * 构造时校验：minimumValue 大于零且小于 2^256 并严格递增；confirmations 为安全正整数、
+ * 不低于全局确认数、不高于所有者数量且随金额不下降；任一违例抛 InvalidSpendingPolicy。
+ */
+export interface ValueThreshold {
+  minimumValue: bigint | number;
+  confirmations: bigint | number;
 }
 
 export interface TransactionSubmission {
@@ -347,6 +374,11 @@ export class MultiSigWallet {
   private confirmations: bigint;
   private version: bigint;
 
+  /** 静态分级支出阈值（按 minimumValue 严格递增，构造时已校验；空数组表示无分级规则） */
+  private readonly valueThresholds: { minimumValue: bigint; confirmations: bigint }[];
+  /** 分级阈值中的最大档确认数（无分级规则时为 0，策略类操作回落到当前全局确认数） */
+  private readonly maxConfirmations: bigint;
+
   /** 下一个期望 nonce（严格递增，顺序提交） */
   private nextNonce = 0n;
   /** 已消费 nonce（入队即消费；失败终态也不释放） */
@@ -380,6 +412,12 @@ export class MultiSigWallet {
     this.ownerSet = new Set(owners);
     this.confirmations = confirmations;
     this.version = 1n;
+    // 分级阈值校验失败抛 InvalidSpendingPolicy，构造中止、不创建实例
+    this.valueThresholds = normalizeValueThresholds(opts.valueThresholds, confirmations, owners.length);
+    this.maxConfirmations =
+      this.valueThresholds.length > 0
+        ? this.valueThresholds[this.valueThresholds.length - 1].confirmations
+        : 0n;
     this.queue = new ExecutionQueue((task) => this.applyTask(task));
   }
 
@@ -399,6 +437,61 @@ export class MultiSigWallet {
 
   get requiredConfirmations(): bigint {
     return this.confirmations;
+  }
+
+  // ---------- 静态分级支出阈值（纯查询：不消费 nonce、不建任务、不改状态） ----------
+
+  /**
+   * 查询一笔金额为 value 的普通交易所需确认数：取不超过 value 的最高档；
+   * 未命中任何档（或无分级规则）时返回全局确认数。
+   * 负数或达到 / 超过 2^256 的金额抛 InvalidSpendingValueError。
+   */
+  requiredConfirmationsForValue(value: bigint | number): bigint {
+    const v = toBigInt(value, InvalidSpendingValueError, 'value');
+    if (!isNonNegativeInteger(v)) {
+      throw new InvalidSpendingValueError('value must be a non-negative integer within 256 bits');
+    }
+    return this.tierConfirmations(v);
+  }
+
+  /**
+   * 查询一个有序调用列表所需确认数：先按与提交同一套规则校验并规范化 calls
+   * （空批量或非法调用项抛 InvalidTransactionBatch），再按 value 总额取档。
+   */
+  requiredConfirmationsForBatch(calls: readonly BatchCallSubmission[]): bigint {
+    const normalized = this.normalizeBatchCalls(calls);
+    let total = 0n;
+    for (const call of normalized) total += call.value;
+    return this.tierConfirmations(total);
+  }
+
+  /** 按金额取档：不超过 value 的最高档确认数；未命中任何档时返回全局确认数 */
+  private tierConfirmations(value: bigint): bigint {
+    let required = this.confirmations;
+    for (const tier of this.valueThresholds) {
+      if (value < tier.minimumValue) break;
+      required = tier.confirmations;
+    }
+    return required;
+  }
+
+  /** 目标任务的有效确认数：单笔按金额、批量按 value 总额、策略变更用最大档 */
+  private taskRequiredConfirmations(payload: WalletTaskPayload): bigint {
+    if (payload.kind === 'transaction') return this.tierConfirmations(payload.value);
+    if (payload.kind === 'transaction-batch') {
+      let total = 0n;
+      for (const call of payload.calls) total += call.value;
+      return this.tierConfirmations(total);
+    }
+    return this.policyConfirmations;
+  }
+
+  /**
+   * 策略变更类操作的有效确认数：分级阈值的最大档；无分级规则（或当前全局确认数
+   * 更高）时取当前全局确认数，与既有行为一致。
+   */
+  private get policyConfirmations(): bigint {
+    return this.maxConfirmations > this.confirmations ? this.maxConfirmations : this.confirmations;
   }
 
   get expectedNonce(): bigint {
@@ -550,14 +643,15 @@ export class MultiSigWallet {
       throw new TaskCancellationConflict(`task ${taskId} is already ${target.status}`);
     }
 
-    // (6) 阈值签名：摘要绑定钱包标识、目标任务 digest、nonce、deadline
+    // (6) 阈值签名：摘要绑定钱包标识、目标任务 digest、nonce、deadline；
+    //     有效确认数按目标任务类型取档（单笔按金额、批量按总额、策略变更用最大档）
     const digest = hashCancellation({
       walletId: this.id,
       taskDigest: target.digest,
       nonce,
       deadline,
     });
-    this.verifyThresholdSignatures(digest, signatures, InvalidCancellation);
+    this.verifyThresholdSignatures(digest, signatures, InvalidCancellation, this.taskRequiredConfirmations(target.payload));
 
     // 原子生效：目标任务进入 cancelled 终态 + 消费 nonce；策略与队列顺序不变
     const cancelled = this.queue.cancel(taskId, this.now(), digest.toString('hex'));
@@ -630,7 +724,8 @@ export class MultiSigWallet {
       id,
       digest,
       version: this.version,
-      confirmations: this.confirmations,
+      // 创建时按金额绑定有效阈值（与直接提交同一取档结果）
+      confirmations: this.tierConfirmations(value),
       nonce,
       deadline,
       to,
@@ -805,7 +900,8 @@ export class MultiSigWallet {
       id,
       digest,
       version,
-      confirmations: this.confirmations,
+      // 策略变更审批使用最大档确认数（与直接提交同一口径）
+      confirmations: this.policyConfirmations,
       nonce,
       deadline,
       newOwners,
@@ -966,6 +1062,9 @@ export class MultiSigWallet {
 
     // (4) 有序调用列表校验与规范化（与直接提交同一套规则；data 复制保存）
     const calls = this.normalizeBatchCalls(sub.calls);
+    // 创建时按 value 总额绑定有效阈值（与直接提交同一取档结果）
+    let callsTotal = 0n;
+    for (const call of calls) callsTotal += call.value;
 
     const req: TransactionBatchApprovalRequest = {
       walletId: this.id,
@@ -985,7 +1084,7 @@ export class MultiSigWallet {
       id,
       digest,
       version: this.version,
-      confirmations: this.confirmations,
+      confirmations: this.tierConfirmations(callsTotal),
       nonce,
       deadline,
       calls,
@@ -1217,7 +1316,9 @@ export class MultiSigWallet {
       );
     }
 
-    // (7) 阈值签名：摘要绑定钱包标识、目标审批摘要、nonce、deadline
+    // (7) 阈值签名：摘要绑定钱包标识、目标审批摘要、nonce、deadline；
+    //     有效确认数按目标审批类型取档（单笔按金额、批量按总额、策略变更用最大档；
+    //     无分级规则时即当前全局确认数，与既有行为一致）
     const req: ApprovalRevocationRequest = {
       walletId: this.id,
       approvalDigest: located.record.digest.toString('hex'),
@@ -1225,6 +1326,16 @@ export class MultiSigWallet {
       deadline,
     };
     const digest = hashApprovalRevocation(req);
+    let required: bigint;
+    if (located.kind === 'transaction') {
+      required = this.tierConfirmations(located.record.value);
+    } else if (located.kind === 'batch') {
+      let total = 0n;
+      for (const call of located.record.calls) total += call.value;
+      required = this.tierConfirmations(total);
+    } else {
+      required = this.policyConfirmations;
+    }
     const signerSet = new Set<Address>();
     for (const blob of blobs) {
       // 形状与可解析性已在字段层校验；此处恢复签名者：对不上当前所有者即签名无效
@@ -1236,9 +1347,9 @@ export class MultiSigWallet {
       }
       signerSet.add(signer); // 地址去重：同一所有者多签只计一次
     }
-    if (BigInt(signerSet.size) < this.confirmations) {
+    if (BigInt(signerSet.size) < required) {
       throw new ApprovalRevocationThresholdNotMetError(
-        `threshold not met: need ${this.confirmations} distinct current owners, got ${signerSet.size}`,
+        `threshold not met: need ${required} distinct current owners, got ${signerSet.size}`,
       );
     }
 
@@ -1307,9 +1418,10 @@ export class MultiSigWallet {
     }
     if (nonce !== this.nextNonce) throw new Invalid(`expected nonce ${this.nextNonce}, got ${nonce}`);
 
-    // (3) 字段校验 + 规范化
+    // (3) 字段校验 + 规范化（同时按分级阈值确定本次提交的有效确认数）
     let payload: WalletTaskPayload;
     let digest: Buffer;
+    let required: bigint;
     if (kind === 'transaction') {
       const to = normalizeAddress(raw.to as string);
       if (to === null || isZeroAddress(to)) throw new Invalid('invalid or zero recipient address');
@@ -1334,6 +1446,8 @@ export class MultiSigWallet {
       };
       digest = hashTransaction(req);
       payload = { kind: 'transaction', deadline, to, value, data };
+      // 单笔按金额取档
+      required = this.tierConfirmations(value);
     } else if (kind === 'transaction-batch') {
       // 有序调用列表：1..64 项；逐项规范化收款地址、金额与 data（顺序保持不变）
       const calls = this.normalizeBatchCalls(raw.calls);
@@ -1345,6 +1459,10 @@ export class MultiSigWallet {
       };
       digest = hashTransactionBatch(req);
       payload = { kind: 'transaction-batch', deadline, calls };
+      // 批量按 value 总额取档
+      let total = 0n;
+      for (const call of calls) total += call.value;
+      required = this.tierConfirmations(total);
     } else {
       // (3) 版本与目标策略字段（直接提交与分阶段审批共用同一套规则）
       const { version, newOwners, newConfirmations } = this.normalizePolicyChangeFields(raw);
@@ -1358,10 +1476,12 @@ export class MultiSigWallet {
       };
       digest = hashPolicyChange(req);
       payload = { kind: 'policy-change', deadline, version, newOwners, newConfirmations };
+      // 策略变更使用最大档确认数
+      required = this.policyConfirmations;
     }
 
-    // (4) 阈值签名：恢复 → 去重 → 必须为当前所有者 → 数量达到当前确认数
-    this.verifyThresholdSignatures(digest, signatures, Invalid);
+    // (4) 阈值签名：恢复 → 去重 → 必须为当前所有者 → 数量达到有效确认数
+    this.verifyThresholdSignatures(digest, signatures, Invalid, required);
 
     // (5) 原子生效（到队列为止）：入队 + 消费 nonce。
     //     入队失败（同一摘要重复等）时不消费 nonce。
@@ -1440,6 +1560,12 @@ export class MultiSigWallet {
     if (newConfirmations <= 0n || newConfirmations > BigInt(newOwners.length)) {
       throw new InvalidPolicyChange(
         `new confirmations must be within 1..new owners (${newOwners.length}), got ${newConfirmations}`,
+      );
+    }
+    // 配置分级阈值时，新所有者数量必须仍能满足最大档确认数
+    if (this.valueThresholds.length > 0 && BigInt(newOwners.length) < this.maxConfirmations) {
+      throw new InvalidPolicyChange(
+        `new owners count ${newOwners.length} is below the maximum tier confirmations ${this.maxConfirmations}`,
       );
     }
     return { version, newOwners, newConfirmations };
@@ -1627,11 +1753,12 @@ export class MultiSigWallet {
     };
   }
 
-  /** 按“当前策略”的所有者集合与确认数校验签名收集 */
+  /** 按“当前策略”的所有者集合校验签名收集；去重签名者数量须达到给定的有效确认数 */
   private verifyThresholdSignatures(
     digest: Uint8Array,
     signatures: readonly Uint8Array[],
     Invalid: new (msg: string) => Error,
+    required: bigint,
   ): void {
     if (!Array.isArray(signatures)) {
       throw new Invalid('signatures must be an array');
@@ -1651,9 +1778,9 @@ export class MultiSigWallet {
       }
       signedBy.add(signer); // 地址去重：同一所有者多签只计一次
     }
-    if (BigInt(signedBy.size) < this.confirmations) {
+    if (BigInt(signedBy.size) < required) {
       throw new Invalid(
-        `threshold not met: need ${this.confirmations} distinct owners, got ${signedBy.size}`,
+        `threshold not met: need ${required} distinct owners, got ${signedBy.size}`,
       );
     }
   }
@@ -1707,8 +1834,50 @@ export class MultiSigWallet {
   }
 }
 
-// ---------- 所有者列表规范化（空/重复/零地址校验） ----------
+// ---------- 静态分级支出阈值规范化（构造时校验；任一违例抛 InvalidSpendingPolicy） ----------
 
+function normalizeValueThresholds(
+  input: readonly ValueThreshold[] | undefined,
+  globalConfirmations: bigint,
+  ownerCount: number,
+): { minimumValue: bigint; confirmations: bigint }[] {
+  if (input === undefined) return [];
+  if (!Array.isArray(input)) {
+    throw new InvalidSpendingPolicy('valueThresholds must be an array');
+  }
+  const tiers: { minimumValue: bigint; confirmations: bigint }[] = [];
+  let prevMinimum = 0n; // minimumValue 必须大于零且严格递增
+  let prevConfirmations = globalConfirmations; // confirmations 不低于全局确认数且随金额不下降
+  for (const raw of input) {
+    if (typeof raw !== 'object' || raw === null) {
+      throw new InvalidSpendingPolicy('each value threshold must be an object');
+    }
+    const minimumValue = toBigInt(raw.minimumValue, InvalidSpendingPolicy, 'minimumValue');
+    if (minimumValue <= 0n || !isNonNegativeInteger(minimumValue)) {
+      throw new InvalidSpendingPolicy('minimumValue must be greater than 0 and less than 2^256');
+    }
+    if (minimumValue <= prevMinimum) {
+      throw new InvalidSpendingPolicy('minimumValue must be strictly increasing');
+    }
+    const confirmations = toBigInt(raw.confirmations, InvalidSpendingPolicy, 'confirmations');
+    if (confirmations <= 0n || confirmations > BigInt(ownerCount)) {
+      throw new InvalidSpendingPolicy(
+        `confirmations must be within 1..owners (${ownerCount}), got ${confirmations}`,
+      );
+    }
+    if (confirmations < prevConfirmations) {
+      throw new InvalidSpendingPolicy(
+        'confirmations must be non-decreasing and not below the global confirmations',
+      );
+    }
+    tiers.push({ minimumValue, confirmations });
+    prevMinimum = minimumValue;
+    prevConfirmations = confirmations;
+  }
+  return tiers;
+}
+
+// ---------- 所有者列表规范化（空/重复/零地址校验） ----------
 function normalizeOwnerList(
   input: readonly string[],
   ErrorCtor: typeof InvalidPolicyChange | typeof InvalidTransaction = InvalidPolicyChange,

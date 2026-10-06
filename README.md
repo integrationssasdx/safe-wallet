@@ -2,7 +2,8 @@
 
 多签钱包策略引擎：阈值策略、签名收集、重放防护、执行队列、策略变更任务、任务取消、
 **原子批量普通交易**，普通交易 / 策略变更 / 批量交易的**分阶段审批**（登记与提交分离、逐个加签），
-以及三类未提交审批的**统一审批撤销**（阈值签名撤销、`revoked` 终态）。
+三类未提交审批的**统一审批撤销**（阈值签名撤销、`revoked` 终态），以及**静态分级支出阈值**
+（按金额 / 批量总额分档的确认数要求，缺省行为不变）。
 
 本仓库从零实现上述能力，不依赖任何外部同类实现或第三方密码学/以太坊库（仅使用 Node.js 内置的
 `node:crypto` 提供 SHA-256/HMAC 与随机数；secp256k1 点运算、RFC 6979 签名与公钥恢复均为内置实现）。
@@ -173,6 +174,7 @@ payload、digest、nonce 及既有取消时间与摘要，不产生调用结果�
   （审批创建/加签、直接提交、任务取消）的签名都无效，反之撤销签名也不能用于这些操作。
 - **独立阈值**：撤销需要**当前所有者**、去重后达到**当前确认数**的一组全新签名，与审批此前
   收集了多少签名无关（即使一个审批签名都没收集，也可由当前所有者阈值直接撤销）。
+  配置静态分级支出阈值时，此处“当前确认数”替换为目标审批的**有效阈值**（见下文章节）。
 - **校验顺序**（任一失败都**不消费 nonce、不改审批/策略/队列**）：
   1. 字段非法（`approvalId` 非字符串、nonce/deadline 非合法非负整数）或签名集合畸形（非数组、
      空、元素非 65 字节、签名不可解析恢复）→ `InvalidApprovalRevocationRequest`；
@@ -192,6 +194,33 @@ payload、digest、nonce 及既有取消时间与摘要，不产生调用结果�
 - 撤销只影响被撤销的那一个审批：同 nonce 的其他候选审批、未撤销审批以及提交、执行、批量、
   队列、幂等等行为均不变（被撤销审批绑定 nonce 已随撤销消费，其他候选再提交时按既有
   `NonceAlreadyUsedError` 拒绝）。
+
+## 静态分级支出阈值
+
+`WalletOptions` 可携带可选的 `valueThresholds`：一个按金额分级的静态阈值表，每项为
+`{ minimumValue, confirmations }`。缺省（或空数组）时行为与既有完全一致——所有操作一律使用
+全局 `confirmations`。
+
+- **构造时校验**（任一违例抛 `InvalidSpendingPolicy`，不创建实例）：
+  - `minimumValue` 必须大于零、小于 2^256，且各档**严格递增**；
+  - `confirmations` 必须为安全正整数、**不低于全局确认数**、**不高于所有者数量**，
+    且随金额**不下降**。
+- **取档查询**（纯查询：不消费 nonce、不建任务、不改状态）：
+  - `requiredConfirmationsForValue(value)`：取**不超过 value 的最高档**；未命中任何档时返回
+    全局确认数。负数或达到 / 超过 2^256 的金额抛 `InvalidSpendingValueError`；
+  - `requiredConfirmationsForBatch(calls)`：先按与提交同一套规则校验调用列表（空批量或非法
+    调用项抛 `InvalidTransactionBatch`），再按 **value 总额**取档。
+- **有效阈值的使用**（同一取档结果贯穿直接提交、三类分阶段审批与入队）：
+  - 单笔交易按金额、批量交易按总额：直接提交与 `createTransactionApproval` /
+    `createBatchApproval` 创建时绑定的确认数均为对应档位；
+  - 策略变更及其审批、取消、撤销使用**最大档**确认数；策略变更的新所有者数量低于最大档时
+    抛 `InvalidPolicyChange`；
+  - 单笔 / 批量任务的取消与审批撤销使用对应有效阈值（无分级规则时即当前全局确认数，
+    与既有行为一致）。
+- **阈值只影响签名数量要求**：交易与批量的签名载荷、payload、digest、任务 id、执行回执、
+  FIFO、取消、失败与幂等语义均不变；阈值不足时直接交易、批量、任务取消分别抛
+  `InvalidTransaction` / `InvalidTransactionBatch` / `InvalidCancellation`，审批提交与撤销
+  分别抛 `ApprovalThresholdNotMetError` / `ApprovalRevocationThresholdNotMetError`。
 
 ## 提交流程（普通交易、批量交易与策略变更共用）
 
@@ -270,6 +299,8 @@ payload、digest、nonce 及既有取消时间与摘要，不产生调用结果�
 | `ApprovalRevocationThresholdNotMetError` | 撤销请求去重当前所有者签名数不足当前确认数 |
 | `InvalidApprovalRevocationNonceError` | 撤销 nonce 未耗用但不等于当前 `expectedNonce`（顺序错；复用仍抛 `NonceAlreadyUsedError`） |
 | `ApprovalRevocationConflictError` | 目标审批已撤销（再加签 / 提交 / 再撤销）或已提交（撤销不适用，走 `cancelTask`） |
+| `InvalidSpendingPolicy` | 构造时分级支出阈值不合法（minimumValue 非正 / 超 256 位 / 未严格递增，confirmations 非正 / 低于全局 / 高于所有者数 / 随金额下降） |
+| `InvalidSpendingValueError` | `requiredConfirmationsForValue` 查询金额为负数或达到 / 超过 2^256 |
 
 提交路径对任意畸形输入（`undefined`、非数字字符串、小数、超大整数、畸形签名集合等）都只会
 抛出上表中的约定错误，不会泄漏原生 `TypeError`/`RangeError`。
