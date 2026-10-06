@@ -54,9 +54,9 @@ export class TaskNotFoundError extends WalletError {}
 
 export class InvalidQueueStateError extends WalletError {}
 
-// ---------- 普通交易分阶段审批 ----------
+// ---------- 分阶段审批（普通交易 / 策略变更共用同一组错误） ----------
 
-/** 审批 id 不存在（创建 / 加签 / 查询 / 提交均抛此异常） */
+/** 审批 id 不存在（创建之外的加签 / 查询 / 提交均抛此异常） */
 export class ApprovalNotFoundError extends WalletError {}
 
 /** 同一所有者对同一审批重复加签 */

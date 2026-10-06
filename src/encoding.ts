@@ -7,6 +7,7 @@
  *   - 策略变更：         "safe-wallet/policy-change/v1"
  *   - 任务取消：         "safe-wallet/cancel/v1"
  *   - 普通交易分阶段审批："safe-wallet/tx-approval/v1"
+ *   - 策略变更分阶段审批："safe-wallet/policy-change-approval/v1"
  *
  * 编码规则（全部大端）：
  *   encBytes(b)  = uint32(len) || b
@@ -27,6 +28,7 @@ const TAG_TX_BATCH = 'safe-wallet/tx-batch/v1';
 const TAG_POLICY_CHANGE = 'safe-wallet/policy-change/v1';
 const TAG_CANCEL = 'safe-wallet/cancel/v1';
 const TAG_TX_APPROVAL = 'safe-wallet/tx-approval/v1';
+const TAG_POLICY_APPROVAL = 'safe-wallet/policy-change-approval/v1';
 
 // ---------- 编码原语 ----------
 
@@ -121,6 +123,17 @@ export interface TransactionApprovalRequest {
   to: Address;
   value: bigint;
   data: Uint8Array;
+}
+
+export interface PolicyApprovalRequest {
+  walletId: string;
+  /** 创建审批时绑定的当前策略版本 */
+  version: bigint;
+  nonce: bigint;
+  deadline: bigint;
+  /** 新所有者顺序（有序列表，顺序参与签名绑定） */
+  newOwners: Address[];
+  newConfirmations: bigint;
 }
 
 function walletIdBytes(walletId: string): Buffer {
@@ -237,5 +250,29 @@ export function hashTransactionApproval(req: {
     encBytes(hexToBytes(req.to)),
     encUint(req.value),
     encBytes(req.data),
+  ]);
+}
+
+/**
+ * 策略变更分阶段审批的签名摘要：绑定钱包标识、创建时策略版本、nonce、截止时间与目标新策略
+ * （新确认数、按顺序编码的新所有者列表）。使用独立的 safe-wallet/policy-change-approval/v1
+ * 域：与既有 safe-wallet/policy-change/v1 直接提交签名互不通用；版本漂移后旧审批签名自然失效
+ * （由引擎按版本拦截）。新所有者列表顺序参与签名，顺序变化即改变摘要。
+ */
+export function hashPolicyApproval(req: {
+  walletId: string;
+  version: bigint | number;
+  nonce: bigint | number;
+  deadline: bigint | number;
+  newOwners: Address[];
+  newConfirmations: bigint | number;
+}): Buffer {
+  return digest(TAG_POLICY_APPROVAL, [
+    encBytes(walletIdBytes(req.walletId)),
+    encUint(req.version),
+    encUint(req.nonce),
+    encUint(deadlineToBigint(req.deadline)),
+    encUint(req.newConfirmations),
+    encList(req.newOwners.map((o) => hexToBytes(o))),
   ]);
 }

@@ -12,6 +12,14 @@
  * 不建任务），addApprovalSignature 逐个收集当前所有者签名（safe-wallet/tx-approval/v1 域，
  * 绑定创建时策略版本与完整交易字段），达到创建时确认数后由 submitApprovedTransaction 按
  * 既有 safe-wallet/tx/v1 摘要入队并只消费创建时 nonce。审批与直接提交的签名摘要互不通用。
+ *
+ * 再新增“策略变更分阶段审批”：createPolicyApproval 登记一次目标策略变更（绑定版本、nonce、
+ * deadline、新所有者顺序与新确认数，不消费 nonce、不建任务、不改策略），
+ * addPolicyApprovalSignature 逐个收集当前所有者签名（safe-wallet/policy-change-approval/v1
+ * 域），达到创建时确认数后由 submitApprovedPolicyChange 按既有 safe-wallet/policy-change/v1
+ * 摘要入队一个 policy-change 任务并只消费创建时 nonce。同一 nonce 可登记多个候选审批，
+ * 登记/加签均不改策略、不耗 nonce、不动队列；提交后执行时若版本已漂移，仍按既有
+ * PolicyConflict 失败终态处理，不改策略。
  */
 
 import {
@@ -24,9 +32,11 @@ import {
 import {
   hashCancellation,
   hashPolicyChange,
+  hashPolicyApproval,
   hashTransaction,
   hashTransactionApproval,
   hashTransactionBatch,
+  type PolicyApprovalRequest,
   type PolicyChangeRequest,
   type TransactionApprovalRequest,
   type TransactionBatchRequest,
@@ -181,6 +191,45 @@ interface ApprovalRecord {
   submitted: boolean;
 }
 
+// ---------- 策略变更分阶段审批 ----------
+
+/** 策略变更审批的公开快照（创建 / 加签 / 查询时返回） */
+export interface PolicyApproval {
+  /** 审批标识（由创建序号与审批摘要派生，引擎内唯一） */
+  id: string;
+  /** 审批签名摘要（hex，safe-wallet/policy-change-approval/v1 域） */
+  digest: string;
+  /** 创建时绑定的策略版本 */
+  version: bigint;
+  /** 创建时绑定的确认数（阈值） */
+  confirmations: bigint;
+  /** 创建时绑定的 nonce（提交时才消费） */
+  nonce: bigint;
+  deadline: bigint;
+  /** 目标新所有者（按创建时给定顺序；顺序参与签名） */
+  newOwners: Address[];
+  newConfirmations: bigint;
+  /** 已收集签名者（按加签顺序，去重） */
+  signers: Address[];
+  status: ApprovalStatus;
+}
+
+/** 策略变更审批的内部记录：目标策略字段 + 版本/nonce 绑定 + 签名收集状态 */
+interface PolicyApprovalRecord {
+  id: string;
+  digest: Buffer;
+  version: bigint;
+  confirmations: bigint;
+  nonce: bigint;
+  deadline: bigint;
+  newOwners: Address[];
+  newConfirmations: bigint;
+  /** 按加签顺序的签名者（与 signatures 的键一一对应） */
+  signers: Address[];
+  signatures: Map<Address, Buffer>;
+  submitted: boolean;
+}
+
 function isNonNegativeInteger(n: bigint, maxBits = 256): boolean {
   return n >= 0n && n < 2n ** BigInt(maxBits);
 }
@@ -210,6 +259,10 @@ export class MultiSigWallet {
   /** 分阶段审批记录（按创建顺序）；创建不消费 nonce，提交时才消费 */
   private readonly approvals = new Map<string, ApprovalRecord>();
   private approvalSeq = 0;
+
+  /** 策略变更分阶段审批记录（按创建顺序）；与普通交易审批各自独立编号、互不影响 */
+  private readonly policyApprovals = new Map<string, PolicyApprovalRecord>();
+  private policyApprovalSeq = 0;
 
   readonly queue: ExecutionQueue<WalletTaskPayload>;
 
@@ -591,6 +644,187 @@ export class MultiSigWallet {
     return task;
   }
 
+  // ---------- 策略变更分阶段审批（签名收集与提交分离；直接 proposePolicyChange 不变） ----------
+
+  /**
+   * 创建一次策略变更的分阶段审批：只校验并登记，不消费 nonce、不建任务、不改策略。
+   *
+   * 审批摘要用 safe-wallet/policy-change-approval/v1 域，绑定钱包标识、创建时策略版本、nonce、
+   * 截止时间与目标新策略（新确认数、按顺序编码的新所有者列表），与直接提交的
+   * safe-wallet/policy-change/v1 摘要互不通用。
+   *
+   * 校验顺序与 proposePolicyChange 一致（失败不产生任何状态变化）：
+   *   1) nonce 复用 → NonceAlreadyUsedError
+   *   2) deadline 早于当前时间 → RequestExpired
+   *   3) 字段 / 版本（须等于当前版本）/ nonce 顺序（须等于 expectedNonce）→ InvalidPolicyChange
+   *
+   * 同一 nonce 可登记多个候选审批（创建不消费 nonce）；成功返回审批快照（空签名者、
+   * collecting 状态）。
+   */
+  createPolicyApproval(sub: PolicyChangeSubmission): PolicyApproval {
+    // (1) nonce 安全转换与复用判定（复用优先于过期，与既有提交一致）
+    const nonce = toBigInt(sub.nonce, InvalidPolicyChange, 'nonce');
+    if (!isNonNegativeInteger(nonce)) throw new InvalidPolicyChange('nonce must be a non-negative integer');
+    if (this.usedNonces.has(nonce)) throw new NonceAlreadyUsedError(nonce);
+
+    // (2) 截止时间
+    const deadline = toBigInt(sub.deadline, InvalidPolicyChange, 'deadline');
+    if (!isNonNegativeInteger(deadline)) throw new InvalidPolicyChange('deadline out of range');
+    if (deadline < this.now()) {
+      throw new RequestExpired(`request deadline ${deadline} already passed`);
+    }
+    // (3) nonce 顺序：创建只登记不消费，但仍须绑定当前期望 nonce（跳号即非法）
+    if (nonce !== this.nextNonce) {
+      throw new InvalidPolicyChange(`expected nonce ${this.nextNonce}, got ${nonce}`);
+    }
+
+    // (4) 版本与目标策略字段校验（与直接提交同一套规则；版本须等于当前版本）
+    const { version, newOwners, newConfirmations } = this.normalizePolicyChangeFields({
+      version: sub.version,
+      newOwners: sub.newOwners,
+      newConfirmations: sub.newConfirmations,
+    });
+
+    const req: PolicyApprovalRequest = {
+      walletId: this.id,
+      version,
+      nonce,
+      deadline,
+      newOwners,
+      newConfirmations,
+    };
+    const digest = hashPolicyApproval(req);
+    const id = createHash('sha256')
+      .update(`policy-approval:${this.policyApprovalSeq}:${digest.toString('hex')}`)
+      .digest('hex')
+      .slice(0, 16);
+    this.policyApprovalSeq += 1;
+
+    const record: PolicyApprovalRecord = {
+      id,
+      digest,
+      version,
+      confirmations: this.confirmations,
+      nonce,
+      deadline,
+      newOwners,
+      newConfirmations,
+      signers: [],
+      signatures: new Map(),
+      submitted: false,
+    };
+    this.policyApprovals.set(id, record);
+    return this.policyApprovalSnapshot(record);
+  }
+
+  /**
+   * 给策略变更审批追加一个 65 字节签名（每次一个）；登记加签不改策略、nonce、队列。
+   *
+   * 校验顺序：
+   *   1) 审批不存在 → ApprovalNotFoundError
+   *   2) 已提交 → ApprovalAlreadySubmittedError
+   *   3) 已过期 → ApprovalExpiredError（过期优先于版本冲突）
+   *   4) 策略版本漂移 → ApprovalPolicyConflictError
+   *   5) 签名格式 / 与摘要不符 / 签名者非当前所有者 → InvalidApprovalSignatureError
+   *   6) 同一所有者重复加签 → DuplicateApprovalSignatureError
+   *
+   * 达到创建时确认数后状态变为 ready；任一失败都不改变审批内容。
+   */
+  addPolicyApprovalSignature(approvalId: string, signature: Uint8Array): PolicyApproval {
+    const record = this.getPolicyApprovalRecord(approvalId);
+    this.assertPolicyApprovalActive(record);
+
+    if (!(signature instanceof Uint8Array) || signature.length !== 65) {
+      throw new InvalidApprovalSignatureError('signature must be a 65-byte r||s||v blob');
+    }
+    const signer = recoverAddress(record.digest, Uint8Array.from(signature));
+    if (signer === null) {
+      throw new InvalidApprovalSignatureError('malformed or non-canonical signature');
+    }
+    if (!this.ownerSet.has(signer)) {
+      throw new InvalidApprovalSignatureError('signature does not match approval or signer is not an owner');
+    }
+    if (record.signatures.has(signer)) {
+      throw new DuplicateApprovalSignatureError(`owner already signed: ${signer}`);
+    }
+    record.signers.push(signer);
+    record.signatures.set(signer, Buffer.from(signature));
+    return this.policyApprovalSnapshot(record);
+  }
+
+  /** 查询策略变更审批快照（状态与按加签顺序的签名者）；未知 id 抛 ApprovalNotFoundError */
+  getPolicyApproval(approvalId: string): PolicyApproval {
+    return this.policyApprovalSnapshot(this.getPolicyApprovalRecord(approvalId));
+  }
+
+  /** 全部策略变更审批快照，按创建顺序排列 */
+  listPolicyApprovals(): PolicyApproval[] {
+    return [...this.policyApprovals.values()].map((r) => this.policyApprovalSnapshot(r));
+  }
+
+  /**
+   * 阈值满足后提交策略变更审批：按既有 safe-wallet/policy-change/v1 摘要入队一个
+   * policy-change 任务，只消费创建时绑定的 nonce 并推进 expectedNonce；策略本身不在提交时
+   * 改变，要到任务执行成功才替换所有者/确认数并递增版本。队列与既有终态行为不变：执行时若
+   * 版本已漂移，任务按既有 PolicyConflict 进入 failed 终态，不改策略。
+   *
+   * 校验顺序（任一失败都不消费 nonce、不建任务、不改策略）：
+   *   1) 审批不存在 → ApprovalNotFoundError；已提交 → ApprovalAlreadySubmittedError
+   *   2) 已过期 → ApprovalExpiredError；版本漂移 → ApprovalPolicyConflictError（过期优先）
+   *   3) 签名不足创建时确认数 → ApprovalThresholdNotMetError
+   *   4) nonce 已消费 → NonceAlreadyUsedError；nonce ≠ expectedNonce（未消费但顺序错）
+   *      → ApprovalNonceConflictError
+   */
+  submitApprovedPolicyChange(approvalId: string): WalletTask {
+    const record = this.getPolicyApprovalRecord(approvalId);
+    this.assertPolicyApprovalActive(record);
+
+    if (BigInt(record.signers.length) < record.confirmations) {
+      throw new ApprovalThresholdNotMetError(
+        `threshold not met: need ${record.confirmations} distinct owners, got ${record.signers.length}`,
+      );
+    }
+    if (this.usedNonces.has(record.nonce)) throw new NonceAlreadyUsedError(record.nonce);
+    if (record.nonce !== this.nextNonce) {
+      throw new ApprovalNonceConflictError(`expected nonce ${this.nextNonce}, got ${record.nonce}`);
+    }
+
+    // 按既有策略变更摘要入队（与 proposePolicyChange 同一域、同一载荷形状）
+    const req: PolicyChangeRequest = {
+      walletId: this.id,
+      version: record.version,
+      nonce: record.nonce,
+      deadline: record.deadline,
+      newOwners: record.newOwners,
+      newConfirmations: record.newConfirmations,
+    };
+    const digest = hashPolicyChange(req);
+    const payload: WalletTaskPayload = {
+      kind: 'policy-change',
+      deadline: record.deadline,
+      version: record.version,
+      newOwners: [...record.newOwners],
+      newConfirmations: record.newConfirmations,
+    };
+    let task: WalletTask;
+    try {
+      task = this.queue.enqueue({
+        nonce: record.nonce,
+        digest: digest.toString('hex'),
+        payload,
+        submittedAt: this.now(),
+      });
+    } catch (err) {
+      if (err instanceof InvalidQueueStateError) throw new InvalidPolicyChange(err.message);
+      throw err;
+    }
+    // 原子生效：入队 + 消费 nonce + 审批进入 submitted 终态（策略在执行成功时才改变）
+    this.usedNonces.add(record.nonce);
+    this.nextNonce = record.nonce + 1n;
+    record.submitted = true;
+    return task;
+  }
+
   // ---------- 执行 ----------
 
   executeTask(taskId: string): WalletTask {
@@ -679,21 +913,8 @@ export class MultiSigWallet {
       digest = hashTransactionBatch(req);
       payload = { kind: 'transaction-batch', deadline, calls };
     } else {
-      const version = toBigInt(raw.version, InvalidPolicyChange, 'version');
-      // (3a) 版本必须绑定当前版本（提交时不匹配 → InvalidPolicyChange；执行时漂移 → PolicyConflict）
-      if (version !== this.version) {
-        throw new InvalidPolicyChange(
-          `policy version mismatch: bound ${version}, current ${this.version}`,
-        );
-      }
-      // (3b) 以当前版本为基准验证新策略
-      const newOwners = normalizeOwnerList(raw.newOwners as string[], InvalidPolicyChange);
-      const newConfirmations = toBigInt(raw.newConfirmations, InvalidPolicyChange, 'newConfirmations');
-      if (newConfirmations <= 0n || newConfirmations > BigInt(newOwners.length)) {
-        throw new InvalidPolicyChange(
-          `new confirmations must be within 1..new owners (${newOwners.length}), got ${newConfirmations}`,
-        );
-      }
+      // (3) 版本与目标策略字段（直接提交与分阶段审批共用同一套规则）
+      const { version, newOwners, newConfirmations } = this.normalizePolicyChangeFields(raw);
       const req: PolicyChangeRequest = {
         walletId: this.id,
         version,
@@ -763,6 +984,34 @@ export class MultiSigWallet {
     return calls;
   }
 
+  /**
+   * 规范化策略变更字段（直接提交 proposePolicyChange 与分阶段审批 createPolicyApproval 共用）：
+   *   - 版本必须绑定当前版本（提交/创建时不匹配 → InvalidPolicyChange；执行时漂移 → PolicyConflict）
+   *   - 新所有者列表非空、无重复、无零地址、全部合法（保持输入顺序）
+   *   - 新确认数大于 0 且不超过新所有者数量
+   * 任一不合法都抛 InvalidPolicyChange；成功返回规范化后的值。
+   */
+  private normalizePolicyChangeFields(raw: Record<string, unknown>): {
+    version: bigint;
+    newOwners: Address[];
+    newConfirmations: bigint;
+  } {
+    const version = toBigInt(raw.version, InvalidPolicyChange, 'version');
+    if (version !== this.version) {
+      throw new InvalidPolicyChange(
+        `policy version mismatch: bound ${version}, current ${this.version}`,
+      );
+    }
+    const newOwners = normalizeOwnerList(raw.newOwners as string[], InvalidPolicyChange);
+    const newConfirmations = toBigInt(raw.newConfirmations, InvalidPolicyChange, 'newConfirmations');
+    if (newConfirmations <= 0n || newConfirmations > BigInt(newOwners.length)) {
+      throw new InvalidPolicyChange(
+        `new confirmations must be within 1..new owners (${newOwners.length}), got ${newConfirmations}`,
+      );
+    }
+    return { version, newOwners, newConfirmations };
+  }
+
   // ---------- 分阶段审批内部辅助 ----------
 
   private getApprovalRecord(approvalId: string): ApprovalRecord {
@@ -800,6 +1049,55 @@ export class MultiSigWallet {
       confirmations: record.confirmations,
       signers: [...record.signers],
       status: this.approvalStatus(record),
+    };
+  }
+
+  // ---------- 策略变更分阶段审批内部辅助 ----------
+
+  private getPolicyApprovalRecord(approvalId: string): PolicyApprovalRecord {
+    const record =
+      typeof approvalId === 'string' ? this.policyApprovals.get(approvalId) : undefined;
+    if (record === undefined) {
+      throw new ApprovalNotFoundError(`policy approval not found: ${String(approvalId)}`);
+    }
+    return record;
+  }
+
+  /** 已提交 / 已过期 / 版本漂移的策略审批不可再加签或提交（过期优先于版本冲突） */
+  private assertPolicyApprovalActive(record: PolicyApprovalRecord): void {
+    if (record.submitted) {
+      throw new ApprovalAlreadySubmittedError(`policy approval ${record.id} already submitted`);
+    }
+    if (record.deadline < this.now()) {
+      throw new ApprovalExpiredError(`policy approval deadline ${record.deadline} already passed`);
+    }
+    if (record.version !== this.version) {
+      throw new ApprovalPolicyConflictError(
+        `policy version drifted: approval bound ${record.version}, current ${this.version}`,
+      );
+    }
+  }
+
+  /** 派生状态：submitted > expired > conflicted > ready > collecting（与普通交易审批同一序） */
+  private policyApprovalStatus(record: PolicyApprovalRecord): ApprovalStatus {
+    if (record.submitted) return 'submitted';
+    if (record.deadline < this.now()) return 'expired';
+    if (record.version !== this.version) return 'conflicted';
+    return BigInt(record.signers.length) >= record.confirmations ? 'ready' : 'collecting';
+  }
+
+  private policyApprovalSnapshot(record: PolicyApprovalRecord): PolicyApproval {
+    return {
+      id: record.id,
+      digest: record.digest.toString('hex'),
+      version: record.version,
+      confirmations: record.confirmations,
+      nonce: record.nonce,
+      deadline: record.deadline,
+      newOwners: [...record.newOwners],
+      newConfirmations: record.newConfirmations,
+      signers: [...record.signers],
+      status: this.policyApprovalStatus(record),
     };
   }
 
