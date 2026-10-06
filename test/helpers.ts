@@ -2,6 +2,7 @@ import { generateKeyPair, signDigest, sha256, type Address, type KeyPair } from 
 import {
   hashCancellation,
   hashPolicyChange,
+  hashPolicyChangeApproval,
   hashTransaction,
   hashTransactionApproval,
   hashTransactionBatch,
@@ -166,3 +167,22 @@ export function signTransactionApproval(
 }
 
 export { sha256 };
+
+export interface PolicyApprovalParams {
+  walletId: string;
+  version: bigint;
+  nonce: bigint;
+  deadline: bigint;
+  newOwners: Address[];
+  newConfirmations: bigint;
+}
+
+export function signPolicyApproval(
+  signers: Actor[],
+  p: PolicyApprovalParams,
+  opts: { mutate?: (base: PolicyApprovalParams) => PolicyApprovalParams } = {},
+): Buffer[] {
+  const finalParams = opts.mutate ? opts.mutate(p) : p;
+  const digest = hashPolicyChangeApproval(finalParams);
+  return signers.map((s) => signDigest(s.privateKey, digest));
+}
