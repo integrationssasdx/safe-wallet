@@ -1,7 +1,8 @@
 # Safe Wallet
 
 多签钱包策略引擎：阈值策略、签名收集、重放防护、执行队列、策略变更任务、任务取消、
-**原子批量普通交易**，以及普通交易 / 策略变更 / 批量交易的**分阶段审批**（登记与提交分离、逐个加签）。
+**原子批量普通交易**、普通交易 / 策略变更 / 批量交易的**分阶段审批**（登记与提交分离、逐个加签），
+以及三类未提交审批共用的**统一审批撤销**。
 
 本仓库从零实现上述能力，不依赖任何外部同类实现或第三方密码学/以太坊库（仅使用 Node.js 内置的
 `node:crypto` 提供 SHA-256/HMAC 与随机数；secp256k1 点运算、RFC 6979 签名与公钥恢复均为内置实现）。
@@ -96,6 +97,7 @@ payload、digest、nonce 及既有取消时间与摘要，不产生调用结果�
 | 加签（每次一个 65 字节签名） | `addApprovalSignature` | `addPolicyApprovalSignature` | `addBatchApprovalSignature` |
 | 阈值满足后提交 | `submitApprovedTransaction` | `submitApprovedPolicyChange` | `submitBatchApproval` |
 | 查询单个 / 列出全部 | `getTransactionApproval` / — | `getPolicyApproval` / `listPolicyApprovals` | `getBatchApproval` / `listBatchApprovals` |
+| 撤销（三类共用） | `revokeApproval({ approvalId, nonce, deadline }, signatures)`（同左，按 id 统一查找） | 同左 | 同左 |
 
 - **创建只登记**：校验与对应直接提交一致，但**不消费 nonce、不建任务、不改策略**。因此同一
   nonce 可以登记多个候选审批（内容可不同，由各自 id 区分；id 按创建序号派生，即使摘要相同
@@ -124,15 +126,16 @@ payload、digest、nonce 及既有取消时间与摘要，不产生调用结果�
   项数与顺序）。任一调用的收款方、金额、data，或调用顺序、项数变化，都会改变摘要。
 
 状态（查询时按此刻时钟/版本派生）优先级固定为
-`submitted > expired > conflicted > ready > collecting`：
+`revoked > submitted > expired > conflicted > ready > collecting`：
 
 | 状态 | 含义 |
 | --- | --- |
 | `collecting` | 未过期、版本未漂移、签名尚未达到创建时确认数 |
 | `ready` | 签名已达阈值，可提交 |
 | `submitted` | 已提交（终态；再加签 / 重复提交抛 `ApprovalAlreadySubmittedError`） |
-| `expired` | deadline 已过（加签 / 提交抛 `ApprovalExpiredError`，优先于版本冲突） |
-| `conflicted` | 创建后策略版本已漂移（加签 / 提交抛 `ApprovalPolicyConflictError`） |
+| `expired` | deadline 已过（加签 / 提交抛 `ApprovalExpiredError`，优先于版本冲突；仍可撤销） |
+| `conflicted` | 创建后策略版本已漂移（加签 / 提交抛 `ApprovalPolicyConflictError`；仍可撤销） |
+| `revoked` | 已被统一审批撤销（终态，优先级最高；加签 / 提交 / 再撤销抛 `ApprovalRevocationConflictError`） |
 
 创建的校验顺序与对应直接提交一致，任一失败都**不产生记录、不消费 nonce、不改策略/队列**：
 
@@ -156,6 +159,45 @@ payload、digest、nonce 及既有取消时间与摘要，不产生调用结果�
 
 `listPolicyApprovals()` / `listBatchApprovals()` 按**创建顺序**返回全部对应审批快照；三类审批
 各自独立编号、互不可见。
+
+## 统一审批撤销
+
+普通交易、策略变更与批量交易三类**尚未提交**的分阶段审批共用一个撤销入口
+`revokeApproval({ approvalId, nonce, deadline }, signatures)`：按审批 id 在三类审批命名空间中
+统一查找目标，阈值签名使用独立域标签 `safe-wallet/approval-revoke/v1`，绑定**钱包标识、
+目标审批自身的审批域摘要（tx-approval / policy-change-approval / tx-batch-approval）、nonce、
+截止时间**。因此撤销签名无法改绑其他钱包或其他审批，也不能授权交易、批量、策略变更、取消或
+审批加签等任何其他操作；三类审批的撤销互相同构。
+
+- **只覆盖未提交审批**：`submitted` 审批不可撤销（抛 `ApprovalRevocationConflictError`）；
+  已过期（`expired`）或版本漂移（`conflicted`）的审批**仍可撤销**——撤销请求有自己独立的
+  nonce 与 deadline，签名者按**当前**所有者集合与当前确认数校验。
+- **成功只消费一次 nonce**：撤销与提交 / 取消共用同一严格递增 nonce 序列（入队 / 生效即消费）。
+  成功后审批进入 `revoked` 终态并返回其快照：**不建任务、不产回执**，不改 owners、
+  confirmations、policyVersion 或任何既有任务，也不影响其他未撤销审批。
+- **快照保留签名者但失效**：`revoked` 快照仍含已收集的 `signers`（按加签顺序）与撤销记录
+  `revocation`（撤销时间、撤销摘要、消费的 nonce 与 deadline），但审批永久失效。状态优先级
+  变为 `revoked > submitted > expired > conflicted > ready > collecting`：撤销后即使审批原
+  deadline 已过或版本继续漂移，状态恒为 `revoked`；再加签、再撤销或提交一律抛
+  `ApprovalRevocationConflictError`。
+
+校验顺序固定为 **字段 → nonce 复用 → deadline → nonce 顺序 → 审批存在性 → 审批状态 → 签名**，
+任一失败都不撤销、不消费 nonce、不改审批 / 策略 / 队列：
+
+1. `approvalId` 非字符串（或空）、nonce / deadline 字段非法、签名不是 65 字节或签名数组畸形
+   （非数组 / 空数组 / 含非字节数组）→ `InvalidApprovalRevocationRequest`。
+2. nonce 已使用 → `NonceAlreadyUsedError`（旧请求重放恒得此异常，即使已过期）。
+3. deadline 早于当前时间 → `RequestExpired`（恰好相等仍有效）。
+4. nonce 未使用但不等于当前 `expectedNonce`（顺序错）→ `InvalidApprovalRevocationNonceError`。
+5. 三类审批命名空间均无该 id → `ApprovalNotFoundError`。
+6. 审批已撤销或已提交 → `ApprovalRevocationConflictError`（`expired` / `conflicted` 不在此列）。
+7. 阈值签名：签名与撤销摘要不匹配（含跨钱包、跨审批及其他操作的签名）或签名者非当前所有者
+   → `InvalidApprovalRevocationSigner`；去重后的当前所有者签名数不足当前确认数
+   → `ApprovalRevocationThresholdNotMetError`。
+
+直接提交、nonce 防重、FIFO 队列、任务取消、批量原子回执、策略生效以及**已提交任务的
+`cancelTask` 处理均保持不变**；未撤销审批的创建、加签、提交、执行、批量、幂等、队列与异常
+行为也完全不变。
 
 ## 提交流程（普通交易、批量交易与策略变更共用）
 
@@ -229,6 +271,11 @@ payload、digest、nonce 及既有取消时间与摘要，不产生调用结果�
 | `ApprovalAlreadySubmittedError` | 对已提交审批再加签或重复提交 |
 | `ApprovalThresholdNotMetError` | 提交审批时去重签名数不足创建时确认数 |
 | `ApprovalNonceConflictError` | 提交审批时绑定 nonce 未耗用但不等于当前 `expectedNonce`（顺序错） |
+| `InvalidApprovalRevocationRequest` | 审批撤销请求字段（approvalId 非字符串、nonce / deadline 非法）或签名集合外形不合法 |
+| `InvalidApprovalRevocationSigner` | 撤销签名与撤销摘要不匹配（含跨钱包、跨审批、其他操作签名）或签名者非当前所有者 |
+| `ApprovalRevocationThresholdNotMetError` | 撤销请求去重后的当前所有者签名数不足当前确认数 |
+| `InvalidApprovalRevocationNonceError` | 撤销 nonce 未耗用但不等于当前 `expectedNonce`（顺序错） |
+| `ApprovalRevocationConflictError` | 撤销已提交 / 已撤销审批，或对已撤销审批再加签、再撤销、提交 |
 
 提交路径对任意畸形输入（`undefined`、非数字字符串、小数、超大整数、畸形签名集合等）都只会
 抛出上表中的约定错误，不会泄漏原生 `TypeError`/`RangeError`。
@@ -259,6 +306,9 @@ digest = sha256( encStr(domainTag) || 各字段 )
   摘要入队。
 - 批量交易审批域标签：`safe-wallet/tx-batch-approval/v1`，字段为钱包标识、创建时版本、
   nonce、截止时间与按顺序编码的全部调用；提交时仍改用 `safe-wallet/tx-batch/v1` 摘要入队。
+- 统一审批撤销域标签：`safe-wallet/approval-revoke/v1`，字段为钱包标识、目标审批自身的审批域
+  摘要（hex，即三类审批各自的 tx-approval / policy-change-approval / tx-batch-approval 摘要）、
+  nonce、截止时间。撤销签名与上述所有域（含三类审批加签、直接提交与取消）互不通用。
 
 ## 密码学约定
 
@@ -273,12 +323,12 @@ digest = sha256( encStr(domainTag) || 各字段 )
 ```
 src/
   crypto.ts    secp256k1 点运算 / RFC6979 签名 / 公钥恢复 / 地址 / SHA-256
-  encoding.ts  规范化长度前缀编码与各类操作（含批量交易、三类分阶段审批）的签名摘要
+  encoding.ts  规范化长度前缀编码与各类操作（含批量交易、三类分阶段审批与统一审批撤销）的签名摘要
   errors.ts    公开错误类型
   queue.ts     FIFO 执行队列（排序、终态、幂等、digest 防重）
-  wallet.ts    多签钱包引擎（阈值、签名收集、nonce、提交校验、批量、策略应用、分阶段审批）
+  wallet.ts    多签钱包引擎（阈值、签名收集、nonce、提交校验、批量、策略应用、分阶段审批与撤销）
   index.ts     统一导出
-test/          node:test 测试（密码学、编码、队列、提交、执行、批量、取消、三类审批、对抗输入）
+test/          node:test 测试（密码学、编码、队列、提交、执行、批量、取消、三类审批、统一撤销、对抗输入）
 ```
 
 ## 最小示例
@@ -408,6 +458,41 @@ wallet.getBatchApproval(approval.id).status; // 'ready'
 const task = wallet.submitBatchApproval(approval.id);
 wallet.getBatchApproval(approval.id).status; // 'submitted'
 wallet.executeTask(task.id).receipt!.result; // { kind: 'transfer-batch', calls: [...] }
+```
+
+### 统一审批撤销
+
+```ts
+import { hashApprovalRevocation } from './src/encoding.ts';
+
+// 任意一类未提交审批（普通交易 / 策略变更 / 批量交易）均可撤销；expired / conflicted 也可以
+const pending = wallet.createTransactionApproval({
+  nonce: wallet.expectedNonce, // 0n；创建不消费
+  deadline: 5000n,
+  to: b.address,
+  value: 10n,
+});
+
+// 撤销请求使用自己的下一个期望 nonce；摘要绑定钱包、目标审批摘要、nonce、deadline
+const revokeDigest = hashApprovalRevocation({
+  walletId: 'wallet-1',
+  approvalDigest: pending.digest,
+  nonce: wallet.expectedNonce, // 0n（撤销与提交/取消共用序列）
+  deadline: 5000n,
+});
+const revokeSigs = [a, b].map((k) => signDigest(k.privateKey, revokeDigest));
+
+const revoked = wallet.revokeApproval(
+  { approvalId: pending.id, nonce: 0n, deadline: 5000n },
+  revokeSigs,
+);
+revoked.status;                 // 'revoked'
+revoked.signers;                // 已收集签名者保留（此处为空）
+revoked.revocation!.digest;     // safe-wallet/approval-revoke/v1 撤销摘要
+wallet.expectedNonce;           // 1n（只消费一次 nonce）
+wallet.tasks.length;            // 0（不建任务、不产回执）
+
+// 已撤销审批永久失效：加签 / 提交 / 再撤销都抛 ApprovalRevocationConflictError
 ```
 
 ## 约定
