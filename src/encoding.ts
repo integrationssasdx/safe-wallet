@@ -8,6 +8,7 @@
  *   - 任务取消：         "safe-wallet/cancel/v1"
  *   - 普通交易分阶段审批："safe-wallet/tx-approval/v1"
  *   - 策略变更分阶段审批："safe-wallet/policy-change-approval/v1"
+ *   - 批量交易分阶段审批："safe-wallet/tx-batch-approval/v1"
  *
  * 编码规则（全部大端）：
  *   encBytes(b)  = uint32(len) || b
@@ -29,6 +30,7 @@ const TAG_POLICY_CHANGE = 'safe-wallet/policy-change/v1';
 const TAG_CANCEL = 'safe-wallet/cancel/v1';
 const TAG_TX_APPROVAL = 'safe-wallet/tx-approval/v1';
 const TAG_POLICY_APPROVAL = 'safe-wallet/policy-change-approval/v1';
+const TAG_TX_BATCH_APPROVAL = 'safe-wallet/tx-batch-approval/v1';
 
 // ---------- 编码原语 ----------
 
@@ -134,6 +136,16 @@ export interface PolicyApprovalRequest {
   /** 新所有者顺序（有序列表，顺序参与签名绑定） */
   newOwners: Address[];
   newConfirmations: bigint;
+}
+
+export interface TransactionBatchApprovalRequest {
+  walletId: string;
+  /** 创建审批时绑定的当前策略版本 */
+  version: bigint;
+  nonce: bigint;
+  deadline: bigint;
+  /** 有序调用列表（1..64 项）；顺序参与签名，不得改变 */
+  calls: BatchTransactionCall[];
 }
 
 function walletIdBytes(walletId: string): Buffer {
@@ -274,5 +286,39 @@ export function hashPolicyApproval(req: {
     encUint(deadlineToBigint(req.deadline)),
     encUint(req.newConfirmations),
     encList(req.newOwners.map((o) => hexToBytes(o))),
+  ]);
+}
+
+/**
+ * 批量交易分阶段审批的签名摘要：绑定钱包标识、创建时策略版本、nonce、截止时间与按顺序编码的
+ * 全部调用（每调用固定按“收款地址 || 金额 || data”编码，再以 encList 绑定项数与顺序）。
+ * 使用独立的 safe-wallet/tx-batch-approval/v1 域：与既有 safe-wallet/tx-batch/v1 直接提交
+ * 签名互不通用；任一调用的收款方/金额/data 变化，或调用顺序/项数变化，都会改变摘要；
+ * 版本漂移后旧审批签名自然失效（由引擎按版本拦截）。
+ */
+export function hashTransactionBatchApproval(req: {
+  walletId: string;
+  version: bigint | number;
+  nonce: bigint | number;
+  deadline: bigint | number;
+  calls: readonly {
+    to: Address;
+    value: bigint | number;
+    data: Uint8Array;
+  }[];
+}): Buffer {
+  const encodedCalls = req.calls.map((call) =>
+    Buffer.concat([
+      encBytes(hexToBytes(call.to)),
+      encUint(call.value),
+      encBytes(call.data),
+    ]),
+  );
+  return digest(TAG_TX_BATCH_APPROVAL, [
+    encBytes(walletIdBytes(req.walletId)),
+    encUint(req.version),
+    encUint(req.nonce),
+    encUint(deadlineToBigint(req.deadline)),
+    encList(encodedCalls),
   ]);
 }

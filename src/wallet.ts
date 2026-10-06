@@ -20,6 +20,14 @@
  * 摘要入队一个 policy-change 任务并只消费创建时 nonce。同一 nonce 可登记多个候选审批，
  * 登记/加签均不改策略、不耗 nonce、不动队列；提交后执行时若版本已漂移，仍按既有
  * PolicyConflict 失败终态处理，不改策略。
+ *
+ * 最后新增“批量交易分阶段审批”：createBatchApproval 登记一个有序调用列表（绑定版本、nonce、
+ * deadline 与含收款地址、金额、data 的有序 calls，沿用 1..64 项及逐项字段校验；不消费 nonce、
+ * 不建任务、不改策略，同一 nonce 可登记多个候选），addBatchApprovalSignature 逐个收集当前
+ * 所有者签名（safe-wallet/tx-batch-approval/v1 域，与 safe-wallet/tx-batch/v1 直接提交签名
+ * 互不通用），达到创建时确认数后由 submitBatchApproval 按既有 safe-wallet/tx-batch/v1 摘要
+ * 只入队一个 transaction-batch 任务并只消费创建时 nonce；执行保持原子回执、FIFO、取消与
+ * 终态幂等语义。任一失败都不留审批、任务、nonce 或策略变化。
  */
 
 import {
@@ -36,9 +44,11 @@ import {
   hashTransaction,
   hashTransactionApproval,
   hashTransactionBatch,
+  hashTransactionBatchApproval,
   type PolicyApprovalRequest,
   type PolicyChangeRequest,
   type TransactionApprovalRequest,
+  type TransactionBatchApprovalRequest,
   type TransactionBatchRequest,
   type TransactionRequest,
 } from './encoding.ts';
@@ -230,6 +240,43 @@ interface PolicyApprovalRecord {
   submitted: boolean;
 }
 
+// ---------- 批量交易分阶段审批 ----------
+
+/** 批量交易审批的公开快照（创建 / 加签 / 查询时返回） */
+export interface BatchApproval {
+  /** 审批标识（由创建序号与审批摘要派生，引擎内唯一） */
+  id: string;
+  /** 审批签名摘要（hex，safe-wallet/tx-batch-approval/v1 域） */
+  digest: string;
+  /** 创建时绑定的策略版本 */
+  version: bigint;
+  /** 创建时绑定的确认数（阈值） */
+  confirmations: bigint;
+  /** 创建时绑定的 nonce（提交时才消费） */
+  nonce: bigint;
+  deadline: bigint;
+  /** 创建时登记的有序调用（顺序即执行顺序；副本返回） */
+  calls: BatchCall[];
+  /** 已收集签名者（按加签顺序，去重） */
+  signers: Address[];
+  status: ApprovalStatus;
+}
+
+/** 批量交易审批的内部记录：有序调用 + 版本/nonce 绑定 + 签名收集状态 */
+interface BatchApprovalRecord {
+  id: string;
+  digest: Buffer;
+  version: bigint;
+  confirmations: bigint;
+  nonce: bigint;
+  deadline: bigint;
+  calls: BatchCall[];
+  /** 按加签顺序的签名者（与 signatures 的键一一对应） */
+  signers: Address[];
+  signatures: Map<Address, Buffer>;
+  submitted: boolean;
+}
+
 function isNonNegativeInteger(n: bigint, maxBits = 256): boolean {
   return n >= 0n && n < 2n ** BigInt(maxBits);
 }
@@ -263,6 +310,10 @@ export class MultiSigWallet {
   /** 策略变更分阶段审批记录（按创建顺序）；与普通交易审批各自独立编号、互不影响 */
   private readonly policyApprovals = new Map<string, PolicyApprovalRecord>();
   private policyApprovalSeq = 0;
+
+  /** 批量交易分阶段审批记录（按创建顺序）；与其他审批各自独立编号、互不影响 */
+  private readonly batchApprovals = new Map<string, BatchApprovalRecord>();
+  private batchApprovalSeq = 0;
 
   readonly queue: ExecutionQueue<WalletTaskPayload>;
 
@@ -825,6 +876,179 @@ export class MultiSigWallet {
     return task;
   }
 
+  // ---------- 批量交易分阶段审批（签名收集与提交分离；直接 submitBatchTransaction 不变） ----------
+
+  /**
+   * 创建一个批量交易的分阶段审批：只校验并登记，不消费 nonce、不建任务、不改策略。
+   *
+   * 审批摘要用 safe-wallet/tx-batch-approval/v1 域，绑定钱包标识、创建时策略版本、nonce、
+   * 截止时间与按顺序编码的全部调用（收款地址、金额、data 逐项复制保存），与直接提交的
+   * safe-wallet/tx-batch/v1 摘要互不通用；任一调用的收款方/金额/data 变化，或调用顺序/项数
+   * 变化，都会改变摘要。
+   *
+   * 校验顺序与 submitBatchTransaction 一致（失败不产生任何状态变化）：
+   *   1) nonce 复用 → NonceAlreadyUsedError
+   *   2) deadline 早于当前时间 → RequestExpired
+   *   3) nonce 跳号（须等于 expectedNonce）、列表（1..64 项）或逐项字段非法 → InvalidTransactionBatch
+   *
+   * 同一 nonce 可登记多个候选审批（创建不消费 nonce）；成功返回审批快照（空签名者、
+   * collecting 状态）。
+   */
+  createBatchApproval(sub: BatchTransactionSubmission): BatchApproval {
+    // (1) nonce 安全转换与复用判定（复用优先于过期，与既有提交一致）
+    const nonce = toBigInt(sub.nonce, InvalidTransactionBatch, 'nonce');
+    if (!isNonNegativeInteger(nonce)) {
+      throw new InvalidTransactionBatch('nonce must be a non-negative integer');
+    }
+    if (this.usedNonces.has(nonce)) throw new NonceAlreadyUsedError(nonce);
+
+    // (2) 截止时间
+    const deadline = toBigInt(sub.deadline, InvalidTransactionBatch, 'deadline');
+    if (!isNonNegativeInteger(deadline)) throw new InvalidTransactionBatch('deadline out of range');
+    if (deadline < this.now()) {
+      throw new RequestExpired(`request deadline ${deadline} already passed`);
+    }
+    // (3) nonce 顺序：创建只登记不消费，但仍须绑定当前期望 nonce（跳号即非法）
+    if (nonce !== this.nextNonce) {
+      throw new InvalidTransactionBatch(`expected nonce ${this.nextNonce}, got ${nonce}`);
+    }
+
+    // (4) 有序调用列表校验与规范化（与直接提交同一套规则；逐项复制 data）
+    const calls = this.normalizeBatchCalls(sub.calls);
+
+    const req: TransactionBatchApprovalRequest = {
+      walletId: this.id,
+      version: this.version,
+      nonce,
+      deadline,
+      calls,
+    };
+    const digest = hashTransactionBatchApproval(req);
+    const id = createHash('sha256')
+      .update(`batch-approval:${this.batchApprovalSeq}:${digest.toString('hex')}`)
+      .digest('hex')
+      .slice(0, 16);
+    this.batchApprovalSeq += 1;
+
+    const record: BatchApprovalRecord = {
+      id,
+      digest,
+      version: this.version,
+      confirmations: this.confirmations,
+      nonce,
+      deadline,
+      calls,
+      signers: [],
+      signatures: new Map(),
+      submitted: false,
+    };
+    this.batchApprovals.set(id, record);
+    return this.batchApprovalSnapshot(record);
+  }
+
+  /**
+   * 给批量交易审批追加一个 65 字节签名（每次一个）；登记加签不改策略、nonce、队列。
+   *
+   * 校验顺序：
+   *   1) 审批不存在 → ApprovalNotFoundError
+   *   2) 已提交 → ApprovalAlreadySubmittedError
+   *   3) 已过期 → ApprovalExpiredError（过期优先于版本冲突）
+   *   4) 策略版本漂移 → ApprovalPolicyConflictError
+   *   5) 签名格式 / 与摘要不符 / 签名者非当前所有者 → InvalidApprovalSignatureError
+   *   6) 同一所有者重复加签 → DuplicateApprovalSignatureError
+   *
+   * 达到创建时确认数后状态变为 ready；任一失败都不改变审批内容。
+   */
+  addBatchApprovalSignature(approvalId: string, signature: Uint8Array): BatchApproval {
+    const record = this.getBatchApprovalRecord(approvalId);
+    this.assertBatchApprovalActive(record);
+
+    if (!(signature instanceof Uint8Array) || signature.length !== 65) {
+      throw new InvalidApprovalSignatureError('signature must be a 65-byte r||s||v blob');
+    }
+    const signer = recoverAddress(record.digest, Uint8Array.from(signature));
+    if (signer === null) {
+      throw new InvalidApprovalSignatureError('malformed or non-canonical signature');
+    }
+    if (!this.ownerSet.has(signer)) {
+      throw new InvalidApprovalSignatureError('signature does not match approval or signer is not an owner');
+    }
+    if (record.signatures.has(signer)) {
+      throw new DuplicateApprovalSignatureError(`owner already signed: ${signer}`);
+    }
+    record.signers.push(signer);
+    record.signatures.set(signer, Buffer.from(signature));
+    return this.batchApprovalSnapshot(record);
+  }
+
+  /** 查询批量交易审批快照（摘要、calls、按加签顺序的签名者与派生状态）；未知 id 抛 ApprovalNotFoundError */
+  getBatchApproval(approvalId: string): BatchApproval {
+    return this.batchApprovalSnapshot(this.getBatchApprovalRecord(approvalId));
+  }
+
+  /** 全部批量交易审批快照，按创建顺序排列 */
+  listBatchApprovals(): BatchApproval[] {
+    return [...this.batchApprovals.values()].map((r) => this.batchApprovalSnapshot(r));
+  }
+
+  /**
+   * 阈值满足后提交批量交易审批：按既有 safe-wallet/tx-batch/v1 摘要只入队一个
+   * transaction-batch 任务，只消费创建时绑定的 nonce 并推进 expectedNonce；执行保持原子
+   * 回执、FIFO、取消与终态幂等语义，与直接提交的批量任务完全一致。
+   *
+   * 校验顺序（任一失败都不消费 nonce、不建任务、不改策略、审批不留痕迹变化）：
+   *   1) 审批不存在 → ApprovalNotFoundError；已提交 → ApprovalAlreadySubmittedError
+   *   2) 已过期 → ApprovalExpiredError；版本漂移 → ApprovalPolicyConflictError（过期优先）
+   *   3) 签名不足创建时确认数 → ApprovalThresholdNotMetError
+   *   4) nonce 已消费 → NonceAlreadyUsedError；nonce ≠ expectedNonce（未消费但顺序错）
+   *      → ApprovalNonceConflictError
+   */
+  submitBatchApproval(approvalId: string): WalletTask {
+    const record = this.getBatchApprovalRecord(approvalId);
+    this.assertBatchApprovalActive(record);
+
+    if (BigInt(record.signers.length) < record.confirmations) {
+      throw new ApprovalThresholdNotMetError(
+        `threshold not met: need ${record.confirmations} distinct owners, got ${record.signers.length}`,
+      );
+    }
+    if (this.usedNonces.has(record.nonce)) throw new NonceAlreadyUsedError(record.nonce);
+    if (record.nonce !== this.nextNonce) {
+      throw new ApprovalNonceConflictError(`expected nonce ${this.nextNonce}, got ${record.nonce}`);
+    }
+
+    // 按既有批量交易摘要入队（与 submitBatchTransaction 同一域、同一载荷形状）
+    const req: TransactionBatchRequest = {
+      walletId: this.id,
+      nonce: record.nonce,
+      deadline: record.deadline,
+      calls: record.calls,
+    };
+    const digest = hashTransactionBatch(req);
+    const payload: WalletTaskPayload = {
+      kind: 'transaction-batch',
+      deadline: record.deadline,
+      calls: record.calls.map((c) => ({ to: c.to, value: c.value, data: Buffer.from(c.data) })),
+    };
+    let task: WalletTask;
+    try {
+      task = this.queue.enqueue({
+        nonce: record.nonce,
+        digest: digest.toString('hex'),
+        payload,
+        submittedAt: this.now(),
+      });
+    } catch (err) {
+      if (err instanceof InvalidQueueStateError) throw new InvalidTransactionBatch(err.message);
+      throw err;
+    }
+    // 原子生效：入队 + 消费 nonce + 审批进入 submitted 终态
+    this.usedNonces.add(record.nonce);
+    this.nextNonce = record.nonce + 1n;
+    record.submitted = true;
+    return task;
+  }
+
   // ---------- 执行 ----------
 
   executeTask(taskId: string): WalletTask {
@@ -1098,6 +1322,55 @@ export class MultiSigWallet {
       newConfirmations: record.newConfirmations,
       signers: [...record.signers],
       status: this.policyApprovalStatus(record),
+    };
+  }
+
+  // ---------- 批量交易分阶段审批内部辅助 ----------
+
+  private getBatchApprovalRecord(approvalId: string): BatchApprovalRecord {
+    const record =
+      typeof approvalId === 'string' ? this.batchApprovals.get(approvalId) : undefined;
+    if (record === undefined) {
+      throw new ApprovalNotFoundError(`batch approval not found: ${String(approvalId)}`);
+    }
+    return record;
+  }
+
+  /** 已提交 / 已过期 / 版本漂移的批量审批不可再加签或提交（过期优先于版本冲突） */
+  private assertBatchApprovalActive(record: BatchApprovalRecord): void {
+    if (record.submitted) {
+      throw new ApprovalAlreadySubmittedError(`batch approval ${record.id} already submitted`);
+    }
+    if (record.deadline < this.now()) {
+      throw new ApprovalExpiredError(`batch approval deadline ${record.deadline} already passed`);
+    }
+    if (record.version !== this.version) {
+      throw new ApprovalPolicyConflictError(
+        `policy version drifted: approval bound ${record.version}, current ${this.version}`,
+      );
+    }
+  }
+
+  /** 派生状态：submitted > expired > conflicted > ready > collecting（与其他审批同一序） */
+  private batchApprovalStatus(record: BatchApprovalRecord): ApprovalStatus {
+    if (record.submitted) return 'submitted';
+    if (record.deadline < this.now()) return 'expired';
+    if (record.version !== this.version) return 'conflicted';
+    return BigInt(record.signers.length) >= record.confirmations ? 'ready' : 'collecting';
+  }
+
+  private batchApprovalSnapshot(record: BatchApprovalRecord): BatchApproval {
+    return {
+      id: record.id,
+      digest: record.digest.toString('hex'),
+      version: record.version,
+      confirmations: record.confirmations,
+      nonce: record.nonce,
+      deadline: record.deadline,
+      // 副本返回：调用方改动返回的 calls/data 不影响审批内容与摘要
+      calls: record.calls.map((c) => ({ to: c.to, value: c.value, data: Buffer.from(c.data) })),
+      signers: [...record.signers],
+      status: this.batchApprovalStatus(record),
     };
   }
 

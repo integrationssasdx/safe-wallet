@@ -6,6 +6,7 @@ import {
   hashTransaction,
   hashTransactionApproval,
   hashTransactionBatch,
+  hashTransactionBatchApproval,
 } from '../src/encoding.ts';
 
 export interface Actor extends KeyPair {}
@@ -182,6 +183,35 @@ export function signPolicyApproval(
 ): Buffer[] {
   const finalParams = opts.mutate ? opts.mutate(p) : p;
   const digest = hashPolicyApproval(finalParams);
+  return signers.map((s) => signDigest(s.privateKey, digest));
+}
+
+export interface BatchApprovalParams {
+  walletId: string;
+  version: bigint;
+  nonce: bigint;
+  deadline: bigint;
+  calls: BatchCallParams[];
+}
+
+export function signBatchApproval(
+  signers: Actor[],
+  p: BatchApprovalParams,
+  opts: { mutate?: (base: BatchApprovalParams) => BatchApprovalParams } = {},
+): Buffer[] {
+  const normalize = (q: BatchApprovalParams) => ({
+    walletId: q.walletId,
+    version: q.version,
+    nonce: q.nonce,
+    deadline: q.deadline,
+    calls: q.calls.map((c) => ({
+      to: c.to,
+      value: c.value ?? 0n,
+      data: c.data ?? new Uint8Array(),
+    })),
+  });
+  const finalParams = opts.mutate ? opts.mutate(p) : p;
+  const digest = hashTransactionBatchApproval(normalize(finalParams));
   return signers.map((s) => signDigest(s.privateKey, digest));
 }
 
