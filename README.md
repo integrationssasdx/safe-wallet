@@ -1,7 +1,7 @@
 # Safe Wallet
 
 多签钱包策略引擎：阈值策略、签名收集、重放防护、执行队列、策略变更任务、任务取消、
-**原子批量普通交易**，以及普通交易 / 策略变更的**分阶段审批**（登记与提交分离、逐个加签）。
+**原子批量普通交易**，以及普通交易 / 策略变更 / 批量交易的**分阶段审批**（登记与提交分离、逐个加签）。
 
 本仓库从零实现上述能力，不依赖任何外部同类实现或第三方密码学/以太坊库（仅使用 Node.js 内置的
 `node:crypto` 提供 SHA-256/HMAC 与随机数；secp256k1 点运算、RFC 6979 签名与公钥恢复均为内置实现）。
@@ -87,26 +87,27 @@ payload、digest、nonce 及既有取消时间与摘要，不产生调用结果�
 
 ## 分阶段审批（登记与提交分离、逐个加签）
 
-普通交易与策略变更都支持“先登记、逐个收集签名、阈值满足后再提交”的分阶段审批，二者规则
-同构、命名空间与域标签各自独立；审批与对应直接提交的签名摘要互不通用。
+普通交易、策略变更与批量交易都支持“先登记、逐个收集签名、阈值满足后再提交”的分阶段审批，
+三者规则同构、命名空间与域标签各自独立；审批与对应直接提交的签名摘要互不通用。
 
-| 操作 | 普通交易审批 | 策略变更审批 |
-| --- | --- | --- |
-| 创建（登记） | `createTransactionApproval` | `createPolicyApproval` |
-| 加签（每次一个 65 字节签名） | `addApprovalSignature` | `addPolicyApprovalSignature` |
-| 阈值满足后提交 | `submitApprovedTransaction` | `submitApprovedPolicyChange` |
-| 查询单个 / 列出全部 | `getTransactionApproval` / — | `getPolicyApproval` / `listPolicyApprovals` |
+| 操作 | 普通交易审批 | 策略变更审批 | 批量交易审批 |
+| --- | --- | --- | --- |
+| 创建（登记） | `createTransactionApproval` | `createPolicyApproval` | `createBatchApproval` |
+| 加签（每次一个 65 字节签名） | `addApprovalSignature` | `addPolicyApprovalSignature` | `addBatchApprovalSignature` |
+| 阈值满足后提交 | `submitApprovedTransaction` | `submitApprovedPolicyChange` | `submitBatchApproval` |
+| 查询单个 / 列出全部 | `getTransactionApproval` / — | `getPolicyApproval` / `listPolicyApprovals` | `getBatchApproval` / `listBatchApprovals` |
 
 - **创建只登记**：校验与对应直接提交一致，但**不消费 nonce、不建任务、不改策略**。因此同一
   nonce 可以登记多个候选审批（内容可不同，由各自 id 区分；id 按创建序号派生，即使摘要相同
   也互不冲突）。创建时绑定当时的策略版本、确认数（阈值）、nonce、deadline 与完整目标内容，
   并复制保存输入（策略审批复制新所有者列表），调用方之后改动原对象不影响审批。
-- **加签只收集**：`addApprovalSignature` / `addPolicyApprovalSignature` 每次只收一个
-  **65 字节**签名，恢复签名者并校验其为**当前所有者**，按加签顺序去重记录；登记加签不改
+- **加签只收集**：`addApprovalSignature` / `addPolicyApprovalSignature` / `addBatchApprovalSignature`
+  每次只收一个 **65 字节**签名，恢复签名者并校验其为**当前所有者**，按加签顺序去重记录；登记加签不改
   策略、nonce、队列。收集到的去重签名数达到**创建时确认数**后，状态由 `collecting` 变
   `ready`。
-- **提交才生效**：阈值满足后由 `submitApproved*` 按**既有直接提交域**的摘要入队一个任务
-  （普通交易 → `safe-wallet/tx/v1`；策略变更 → `safe-wallet/policy-change/v1`），只消费
+- **提交才生效**：阈值满足后由 `submitApproved*` / `submitBatchApproval` 按**既有直接提交域**的
+  摘要入队一个任务（普通交易 → `safe-wallet/tx/v1`；策略变更 → `safe-wallet/policy-change/v1`；
+  批量交易 → `safe-wallet/tx-batch/v1`），只消费
   **创建时绑定的 nonce** 并推进 `expectedNonce`，审批进入 `submitted` 终态。之后的执行、
   取消、终态幂等等队列行为与直接提交完全一致；策略变更审批任务执行时若版本已漂移，仍按既有
   **`PolicyConflict`** 进入失败终态、不改策略。
@@ -118,6 +119,9 @@ payload、digest、nonce 及既有取消时间与摘要，不产生调用结果�
 - 策略变更审批：`safe-wallet/policy-change-approval/v1`，绑定**钱包标识、版本、nonce、
   deadline 与目标新策略**（新确认数、按顺序编码的新所有者列表）。新所有者顺序参与签名，
   顺序变化即改变摘要。
+- 批量交易审批：`safe-wallet/tx-batch-approval/v1`，绑定**钱包标识、版本、nonce、deadline
+  与按顺序编码的全部调用**（每调用固定按“收款地址 || 金额 || data”编码，再以数量前缀绑定
+  项数与顺序）。任一调用的收款方、金额、data，或调用顺序、项数变化，都会改变摘要。
 
 状态（查询时按此刻时钟/版本派生）优先级固定为
 `submitted > expired > conflicted > ready > collecting`：
@@ -133,10 +137,12 @@ payload、digest、nonce 及既有取消时间与摘要，不产生调用结果�
 创建的校验顺序与对应直接提交一致，任一失败都**不产生记录、不消费 nonce、不改策略/队列**：
 
 1. 字段安全转换失败 / nonce 已用 → 普通交易审批 `InvalidTransaction`、策略变更审批
-   `InvalidPolicyChange`；nonce 已用 → `NonceAlreadyUsedError`（复用判定优先于过期）。
+   `InvalidPolicyChange`、批量审批 `InvalidTransactionBatch`；nonce 已用 →
+   `NonceAlreadyUsedError`（复用判定优先于过期）。
 2. deadline 早于当前时间 → `RequestExpired`。
 3. 其余内容校验（nonce 须等于 `expectedNonce`；策略审批另查版本须等于当前版本、新所有者
-   列表与新确认数合法性）→ 对应 `Invalid*`。
+   列表与新确认数合法性；批量审批另查 calls 为 1..64 项、收款地址、金额与 data）
+   → 对应 `Invalid*`。
 
 加签 / 提交的校验顺序（任一失败都不改变审批与任何既有状态）：
 
@@ -148,7 +154,7 @@ payload、digest、nonce 及既有取消时间与摘要，不产生调用结果�
 5. 提交：绑定 nonce 已被消费（含被同批其他候选或直接提交消费）→ `NonceAlreadyUsedError`；
    nonce 尚未耗用但不等于当前 `expectedNonce`（顺序错）→ `ApprovalNonceConflictError`。
 
-`listPolicyApprovals()` 按**创建顺序**返回全部策略变更审批快照；策略审批与普通交易审批
+`listPolicyApprovals()` / `listBatchApprovals()` 按**创建顺序**返回全部对应审批快照；三类审批
 各自独立编号、互不可见。
 
 ## 提交流程（普通交易、批量交易与策略变更共用）
@@ -251,6 +257,8 @@ digest = sha256( encStr(domainTag) || 各字段 )
 - 策略变更审批域标签：`safe-wallet/policy-change-approval/v1`，字段为钱包标识、创建时版本、
   nonce、截止时间、新确认数、新所有者列表；提交时仍改用 `safe-wallet/policy-change/v1`
   摘要入队。
+- 批量交易审批域标签：`safe-wallet/tx-batch-approval/v1`，字段为钱包标识、创建时版本、
+  nonce、截止时间与按顺序编码的全部调用；提交时仍改用 `safe-wallet/tx-batch/v1` 摘要入队。
 
 ## 密码学约定
 
@@ -265,12 +273,12 @@ digest = sha256( encStr(domainTag) || 各字段 )
 ```
 src/
   crypto.ts    secp256k1 点运算 / RFC6979 签名 / 公钥恢复 / 地址 / SHA-256
-  encoding.ts  规范化长度前缀编码与各类操作（含批量交易、两类分阶段审批）的签名摘要
+  encoding.ts  规范化长度前缀编码与各类操作（含批量交易、三类分阶段审批）的签名摘要
   errors.ts    公开错误类型
   queue.ts     FIFO 执行队列（排序、终态、幂等、digest 防重）
   wallet.ts    多签钱包引擎（阈值、签名收集、nonce、提交校验、批量、策略应用、分阶段审批）
   index.ts     统一导出
-test/          node:test 测试（密码学、编码、队列、提交、执行、批量、取消、两类审批、对抗输入）
+test/          node:test 测试（密码学、编码、队列、提交、执行、批量、取消、三类审批、对抗输入）
 ```
 
 ## 最小示例
@@ -365,6 +373,41 @@ wallet.getPolicyApproval(approval.id).status; // 'ready'
 const task = wallet.submitApprovedPolicyChange(approval.id);
 wallet.getPolicyApproval(approval.id).status; // 'submitted'
 wallet.executeTask(task.id);                  // 执行成功才替换策略、版本 1 → 2
+```
+
+### 批量交易分阶段审批
+
+```ts
+import { hashBatchApproval } from './src/encoding.ts';
+
+const batch = {
+  nonce: wallet.expectedNonce, // 创建不消费
+  deadline: 5000n,
+  calls: [
+    { to: b.address, value: 100n, data: new Uint8Array() },
+    { to: c.address, value: 200n, data: Buffer.from('calldata') },
+  ],
+};
+
+// 1) 登记（不消费 nonce、不建任务、不改策略）；同一 nonce 可登记多个候选
+const approval = wallet.createBatchApproval(batch);
+
+// 2) 当前所有者逐个加签（65 字节；safe-wallet/tx-batch-approval/v1 域）
+const approvalDigest = hashBatchApproval({
+  walletId: 'wallet-1',
+  version: wallet.policyVersion,
+  ...batch,
+});
+for (const k of [a, b]) {
+  wallet.addBatchApprovalSignature(approval.id, signDigest(k.privateKey, approvalDigest));
+}
+wallet.getBatchApproval(approval.id).status; // 'ready'
+
+// 3) 阈值满足后提交：按既有 tx-batch/v1 摘要入队一个 transaction-batch 任务，
+//    只消费创建时 nonce；执行仍产出单个 transfer-batch 原子回执
+const task = wallet.submitBatchApproval(approval.id);
+wallet.getBatchApproval(approval.id).status; // 'submitted'
+wallet.executeTask(task.id).receipt!.result; // { kind: 'transfer-batch', calls: [...] }
 ```
 
 ## 约定
