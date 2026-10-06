@@ -28,6 +28,23 @@ export class InvalidTransactionBatch extends WalletError {}
 /** 策略变更字段、版本、签名或 nonce 顺序不合法（不建任务、不消费 nonce、不改策略） */
 export class InvalidPolicyChange extends WalletError {}
 
+// ---------- 静态分级支出阈值 ----------
+
+/**
+ * 静态分级支出阈值配置（WalletOptions.valueThresholds）不合法：minimumValue
+ * 不在 1..2^256-1 内或不严格递增；confirmations 非安全正整数、低于全局确认数、
+ * 高于配置所有者数，或随金额不下降。仅在构造时抛出，违规即无钱包实例；
+ * 与初始 confirmations 越界一致沿用 InvalidPolicyChange 家族。
+ */
+export class InvalidSpendingPolicy extends WalletError {}
+
+/**
+ * 查询 requiredConfirmationsForValue 的金额不合法：负数或超过 256 位。
+ * 这是只读查询错误（查询不消费 nonce、不建任务、不改状态），与提交路径把
+ * 越界金额归为 InvalidTransaction / InvalidTransactionBatch 的口径互不影响。
+ */
+export class InvalidSpendingValueError extends WalletError {}
+
 /** 请求截止时间早于当前时间（提交时与执行时均可出现，不产生任务/不进入终态） */
 export class RequestExpired extends WalletError {}
 

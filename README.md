@@ -2,7 +2,8 @@
 
 多签钱包策略引擎：阈值策略、签名收集、重放防护、执行队列、策略变更任务、任务取消、
 **原子批量普通交易**，普通交易 / 策略变更 / 批量交易的**分阶段审批**（登记与提交分离、逐个加签），
-以及三类未提交审批的**统一审批撤销**（阈值签名撤销、`revoked` 终态）。
+三类未提交审批的**统一审批撤销**（阈值签名撤销、`revoked` 终态），以及可选的
+**静态分级支出阈值**（单笔按金额、批量按总额提升所需确认数）。
 
 本仓库从零实现上述能力，不依赖任何外部同类实现或第三方密码学/以太坊库（仅使用 Node.js 内置的
 `node:crypto` 提供 SHA-256/HMAC 与随机数；secp256k1 点运算、RFC 6979 签名与公钥恢复均为内置实现）。
@@ -193,6 +194,79 @@ payload、digest、nonce 及既有取消时间与摘要，不产生调用结果�
   队列、幂等等行为均不变（被撤销审批绑定 nonce 已随撤销消费，其他候选再提交时按既有
   `NonceAlreadyUsedError` 拒绝）。
 
+## 静态分级支出阈值
+
+钱包可在构造时通过 `WalletOptions.valueThresholds` 提供一张**静态**金额档位表，金额越高
+要求越多所有者签名；缺省或传空数组时钱包只有全局 `confirmations` 一档，**所有行为与旧版本
+完全一致**。档位表在构造后不可变，策略变更任务**不改变**档位表。
+
+```ts
+new MultiSigWallet({
+  id: 'wallet-1',
+  owners: [a.address, b.address, c.address, d.address],
+  confirmations: 1n,                 // 全局确认数（未命中任何档位时使用）
+  valueThresholds: [
+    { minimumValue: 1_000n,  confirmations: 2n },
+    { minimumValue: 10_000n, confirmations: 3n },
+    { minimumValue: 50_000n, confirmations: 4n },
+  ],
+});
+```
+
+- 每个档位含 `minimumValue`（含该值）与 `confirmations`。
+- **单笔交易**按自身金额取档；**原子批量交易**按 `calls` 全部金额的**总额**取档（逐项金额
+  仍各自受限 256 位）。取档规则：取 `minimumValue ≤ value` 的**最高档**；低于首档或无规则
+  钱包返回全局确认数。上例中 value=999 → 1 签、value=1_000 → 2 签、value=9_999 → 2 签、
+  value=10_000 → 3 签、value 越高不下降。
+
+### 构造期校验（违例抛 `InvalidSpendingPolicy`，无实例）
+
+- `valueThresholds` 必须是数组（或缺省）；每项必须是对象；空数组合法（等价于无规则）。
+- `minimumValue` 必须为 **1..2^256−1** 的整数，且各档**严格递增**（相等即违例）。
+- `confirmations` 必须为安全正整数：**不低于全局确认数**、**不高于所有者数**，且随金额
+  **不下降**（可以持平）。
+
+任何一条违例都抛 `InvalidSpendingPolicy`，钱包实例不会被创建。
+
+### 查询（只读，不消费 nonce、不建任务、不改状态）
+
+- `requiredConfirmationsForValue(value)`：返回单笔金额对应的有效确认数；`value` 为负数或
+  超过 256 位时抛 `InvalidSpendingValueError`（接受 bigint / 安全整数 / 纯数字字符串）。
+- `requiredConfirmationsForBatch(calls)`：先按批量规则校验 `calls`（空批量 / 超过 64 项 /
+  非法收款地址 / 金额越界 / data 非 `Uint8Array` → `InvalidTransactionBatch`），再按金额
+  总额取档。
+- `wallet.maxSpendingConfirmations`：最大档确认数（无规则钱包即全局确认数）。
+- `wallet.spendingThresholds`：规范化档位表的升序副本（无规则钱包为 `[]`）。
+
+### 各路径的有效阈值
+
+| 路径 | 有效确认数 | 不足时的错误 |
+| --- | --- | --- |
+| 直接单笔提交 `submitTransaction` | 按金额取档 | `InvalidTransaction` |
+| 直接批量提交 `submitBatchTransaction` | 按 calls 总额取档 | `InvalidTransactionBatch` |
+| 单笔审批创建 / 加签 / `submitApprovedTransaction` / 撤销 | 按金额档（创建时快照驱动 ready 与提交） | `ApprovalThresholdNotMetError` / `ApprovalRevocationThresholdNotMetError` |
+| 批量审批创建 / 加签 / `submitBatchApproval` / 撤销 | 按 calls 总额档 | 同上 |
+| 任务取消 `cancelTask` | 目标任务的有效阈值（单笔按金额 / 批量按总额） | `InvalidCancellation` |
+| 直接策略变更 `proposePolicyChange` 与策略审批创建/加签/提交/撤销 | **恒为最大档** | `InvalidPolicyChange` / `ApprovalThresholdNotMetError` / `ApprovalRevocationThresholdNotMetError` |
+
+说明：
+
+- 三类审批在**创建时**把对应有效阈值快照进审批记录（快照同时体现在 `approval.confirmations`
+  与 ready 判定上）；`add*Signature` 仍要求签名者是**当前所有者**，提交时去重签名数须达到
+  该快照，否则 `ApprovalThresholdNotMetError`。
+- 审批**撤销**与任务**取消**在操作发生的当下按当前策略重新求值有效阈值（签名者也必须是当前
+  所有者）：命中档位时使用静态档位值；未命中档位时回落到**当前**全局确认数。因此一个未命中
+  档位的 conflicted 审批，在全局确认数被策略变更下调后，仍可按新的当前确认数撤销/取消，与
+  无规则钱包的既有行为一致。
+- **策略变更恒按最大档确认数**授权（无规则钱包最大档即全局确认数，行为不变）；配置了分级
+  阈值时，目标新所有者数量若**低于最大档**，提交 / 登记直接抛 `InvalidPolicyChange`
+  （避免变更后高档支出再也无法授权）。无规则钱包不新增此约束，仍可在“新确认数 ≤ 新所有者
+  数”的既有规则下原子缩编所有者集合。
+- 分级阈值**只改变所需签名数**：单笔与批量的签名载荷、payload、digest、任务 id、执行回执、
+  FIFO、取消、失败终态与幂等与无规则钱包完全相同；阈值不足时不会入队、不消费 nonce、不改
+  状态。失败仍遵循既有原子性（不建任务、不消费 nonce、不改 owners/confirmations/version/
+  审批/队列），错误优先级与无规则钱包一致（nonce 复用 → 过期 → 内容/nonce 顺序 → 签名阈值）。
+
 ## 提交流程（普通交易、批量交易与策略变更共用）
 
 对每次提交，系统按顺序核对，任一失败都**不创建任务、不消费 nonce、不改变当前策略**：
@@ -249,7 +323,9 @@ payload、digest、nonce 及既有取消时间与摘要，不产生调用结果�
 | --- | --- |
 | `InvalidTransaction` | 普通交易字段、nonce 顺序或签名不合法 |
 | `InvalidTransactionBatch` | 批量交易列表（空/超 64 项）、调用字段（地址/金额/data）、nonce 顺序或签名不合法 |
-| `InvalidPolicyChange` | 策略变更字段、版本（提交时）、nonce 顺序或签名不合法 |
+| `InvalidPolicyChange` | 策略变更字段、版本（提交时）、nonce 顺序或签名不合法；含分级阈值钱包的新所有者数低于最大档确认数 |
+| `InvalidSpendingPolicy` | 构造时 `valueThresholds` 配置违例（minimumValue 越界/非严格递增，confirmations 非安全正整数/低于全局确认数/高于所有者数/随金额下降）；无实例产生 |
+| `InvalidSpendingValueError` | 只读查询 `requiredConfirmationsForValue` 的金额为负数或超过 256 位 |
 | `InvalidCancellation` | 取消请求字段、nonce 顺序或签名不合法 |
 | `TaskCancellationConflict` | 取消目标已处于终态（executed / failed / cancelled） |
 | `RequestExpired` | 截止时间早于当前时间（提交时抛出；执行时表现为失败终态回执原因） |
@@ -319,7 +395,7 @@ src/
   encoding.ts  规范化长度前缀编码与各类操作（含批量交易、三类分阶段审批、统一撤销）的签名摘要
   errors.ts    公开错误类型
   queue.ts     FIFO 执行队列（排序、终态、幂等、digest 防重）
-  wallet.ts    多签钱包引擎（阈值、签名收集、nonce、提交校验、批量、策略应用、分阶段审批与统一撤销）
+  wallet.ts    多签钱包引擎（阈值、签名收集、nonce、提交校验、批量、策略应用、分阶段审批、统一撤销与静态分级支出阈值）
   index.ts     统一导出
 test/          node:test 测试（密码学、编码、队列、提交、执行、批量、取消、三类审批、统一撤销、对抗输入）
 ```
@@ -486,6 +562,43 @@ wallet.tasks.length;             // 0（不建任务、不产回执）
 wallet.getTransactionApproval(approval.id).status; // 'revoked'
 // 此后 addApprovalSignature / submitApprovedTransaction / 再次 revokeApproval
 // 都抛 ApprovalRevocationConflictError
+```
+
+### 静态分级支出阈值
+
+```ts
+// 4 所有者；小额 1 签，1_000 起 2 签，10_000 起 3 签，50_000 起 4 签（所有者全员）
+const wallet = new MultiSigWallet({
+  id: 'wallet-1',
+  owners: [a.address, b.address, c.address, d.address],
+  confirmations: 1n,
+  valueThresholds: [
+    { minimumValue: 1_000n, confirmations: 2n },
+    { minimumValue: 10_000n, confirmations: 3n },
+    { minimumValue: 50_000n, confirmations: 4n },
+  ],
+});
+
+// 只读取档（不消费 nonce、不建任务、不改状态）
+wallet.requiredConfirmationsForValue(500n);     // 1n（未命中首档 → 全局确认数）
+wallet.requiredConfirmationsForValue(1_000n);   // 2n（边界含 minimumValue）
+wallet.requiredConfirmationsForValue(9_999n);   // 2n
+wallet.requiredConfirmationsForValue(50_000n);  // 4n
+wallet.requiredConfirmationsForBatch([
+  { to: b.address, value: 6_000n, data: new Uint8Array() },
+  { to: c.address, value: 6_000n, data: new Uint8Array() },
+]);                                              // 3n（总额 12_000 落入第二档与第三档之间）
+
+// 直接提交 / 审批 / 取消 / 撤销都按同一有效阈值核对签名；
+// 金额 10_000 的单笔只有 2 个签名 → 抛 InvalidTransaction（不入队、不消费 nonce）
+const digest = hashTransaction({
+  walletId: 'wallet-1', nonce: 0n, deadline: 5000n, to: b.address, value: 10_000n,
+  data: new Uint8Array(),
+});
+const sigs = [a, b].map((k) => signDigest(k.privateKey, digest));
+// wallet.submitTransaction({ nonce: 0n, deadline: 5000n, to: b.address, value: 10_000n }, sigs)
+//   → InvalidTransaction: threshold not met: need 3 distinct owners, got 2
+// 签名载荷/digest 与无规则钱包完全一致：补齐第三个签名后同一 digest 即可入队
 ```
 
 ## 约定
